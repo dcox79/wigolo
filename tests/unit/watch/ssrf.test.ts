@@ -28,6 +28,12 @@ describe('SSRF stable reason codes', () => {
     if (!r.ok) expect(r.code).toBe(SSRF_CODES.BAD_PROTOCOL);
   });
 
+  it('URL-embedded credentials → ssrf_invalid_url', () => {
+    const r = guardFetchUrl('https://user:pass@example.com/', 'url');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe(SSRF_CODES.INVALID_URL);
+  });
+
   it('link-local metadata IP → ssrf_metadata', () => {
     const r = guardFetchUrl('http://169.254.169.254/latest/meta-data/', 'url');
     expect(r.ok).toBe(false);
@@ -102,6 +108,14 @@ describe('guardUrl SSRF', () => {
     it('accepts a query string and fragment', () => {
       const r = guardUrl('https://example.com/page?q=1#frag', 'url');
       expect(r.ok).toBe(true);
+    });
+  });
+
+  describe('rejects URL-embedded credentials', () => {
+    it('rejects credentials in strict watch/webhook URLs', () => {
+      const r = guardUrl('https://user:pass@example.com/', 'url');
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe(SSRF_CODES.INVALID_URL);
     });
   });
 
@@ -395,5 +409,14 @@ describe('guardFetchUrl SSRF', () => {
     it('rejects gopher://', () => {
       expect(guardFetchUrl('gopher://example.com/', 'url').ok).toBe(false);
     });
+  });
+
+  it('rejects URL-embedded credentials even when private targets are allowed', () => {
+    const r = guardFetchUrl('https://user:pass@example.com/', 'url', { allowPrivate: true });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.code).toBe(SSRF_CODES.INVALID_URL);
+      expect(r.reason).toMatch(/credentials/i);
+    }
   });
 });

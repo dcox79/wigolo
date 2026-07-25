@@ -3,6 +3,7 @@ import * as http from 'node:http';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { DaemonHttpServer } from '../../src/daemon/http-server.js';
+import { SSRF_CODES } from '../../src/watch/ssrf.js';
 
 /**
  * WHY: the REST surface is the P2 self-host contract. These rows pin the
@@ -124,6 +125,13 @@ describe('REST API — open loopback mode', () => {
     const r = await post(port, '/v1/fetch', {});
     expect(r.status).toBe(400);
     expect((r.body as { error_reason: string }).error_reason).toBe('invalid_input');
+  });
+
+  it('URL-embedded credentials → 400 ssrf_invalid_url before fetch', async () => {
+    const r = await post(port, '/v1/fetch', { url: 'https://user:pass@example.com/' });
+    expect(r.status).toBe(400);
+    expect((r.body as { error_reason: string; stage: string }).error_reason).toBe(SSRF_CODES.INVALID_URL);
+    expect((r.body as { stage: string }).stage).toBe('validate');
   });
 
   it('oversized body → 413', async () => {

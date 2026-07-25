@@ -48,4 +48,13 @@ describe('guardServeTarget', () => {
     const r = guardServeTarget('not a url', { bindIsLoopback: true });
     expect(r.ok).toBe(false);
   });
+
+  it('URL-embedded credentials → refused as invalid input', () => {
+    const r = guardServeTarget('https://user:pass@example.com/', { bindIsLoopback: true });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.code).toBe(SSRF_CODES.INVALID_URL);
+      expect(r.reason).toMatch(/credentials/i);
+    }
+  });
 });

@@ -160,6 +160,15 @@ export function guardUrl(raw: string, fieldLabel: string): SsrfResult {
     };
   }
 
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      code: SSRF_CODES.INVALID_URL,
+      reason: `${fieldLabel} must not contain URL-embedded credentials`,
+      hint: 'Pass credentials through the explicit authentication options instead.',
+    };
+  }
+
   const host = parsed.hostname.toLowerCase();
   if (PRIVATE_HOSTNAMES.has(host)) {
     return {
@@ -244,6 +253,15 @@ export function guardFetchUrl(
       code: SSRF_CODES.BAD_PROTOCOL,
       reason: `${fieldLabel} uses a forbidden protocol (${parsed.protocol})`,
       hint: 'Only http: and https: are allowed.',
+    };
+  }
+
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      code: SSRF_CODES.INVALID_URL,
+      reason: `${fieldLabel} must not contain URL-embedded credentials`,
+      hint: 'Pass credentials through the explicit authentication options instead.',
     };
   }
 
