@@ -75,7 +75,7 @@ describe('defaultSecretStore — keychain tier', () => {
   it('does NOT write a file when keychain succeeded', async () => {
     const store = defaultSecretStore({ dataDir: tmp });
     await store.set('llmApiKey', 'sk-keychain-only');
-    expect(existsSync(join(tmp, 'keys', 'llmApiKey'))).toBe(false);
+    expect(existsSync(join(tmp, 'keys', 'llmApiKey.enc'))).toBe(false);
   });
 });
 
@@ -106,12 +106,12 @@ describe('defaultSecretStore — file fallback', () => {
   it.skipIf(process.platform === 'win32')('writes the file with mode 0o600', async () => {
     const store = defaultSecretStore({ dataDir: tmp });
     await store.set('llmApiKey', 'sk-on-disk');
-    const path = join(tmp, 'keys', 'llmApiKey');
+    const path = join(tmp, 'keys', 'llmApiKey.enc');
     expect(existsSync(path)).toBe(true);
     const stat = statSync(path);
     // Mask off file-type bits, compare only permission bits.
     expect(stat.mode & 0o777).toBe(0o600);
-    expect(readFileSync(path, 'utf-8')).toBe('sk-on-disk');
+    expect(readFileSync(path, 'utf-8')).not.toContain('sk-on-disk');
   });
 
   // POSIX-only: Windows directory ACLs don't map to POSIX mode bits.
@@ -133,7 +133,7 @@ describe('defaultSecretStore — file fallback', () => {
     const store = defaultSecretStore({ dataDir: tmp });
     await store.set('llmApiKey', 'sk-bye-file');
     await store.remove('llmApiKey');
-    expect(existsSync(join(tmp, 'keys', 'llmApiKey'))).toBe(false);
+    expect(existsSync(join(tmp, 'keys', 'llmApiKey.enc'))).toBe(false);
     expect(await store.get('llmApiKey')).toBeNull();
   });
 
@@ -167,6 +167,8 @@ describe('defaultSecretStore — keychain-available-but-throws falls back to fil
     const store = defaultSecretStore({ dataDir: tmp });
     const result = await store.set('llmApiKey', 'sk-fallback');
     expect(result.location).toBe('file');
-    expect(readFileSync(join(tmp, 'keys', 'llmApiKey'), 'utf-8')).toBe('sk-fallback');
+    const encrypted = readFileSync(join(tmp, 'keys', 'llmApiKey.enc'), 'utf-8');
+    expect(encrypted).not.toContain('sk-fallback');
+    expect(await store.get('llmApiKey')).toBe('sk-fallback');
   });
 });

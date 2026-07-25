@@ -542,7 +542,7 @@ describe('installAgent', () => {
     const entry = navigate(cfg, ['mcpServers', 'wigolo']) as Record<string, unknown>;
     expect(entry).toBeDefined();
     expect(entry.command).toBe('npx');
-    expect(entry.args).toEqual(['-y', 'wigolo']);
+    expect(entry.args).toEqual(['-y', 'wigolo@0.2.1']);
     const env = entry.env as Record<string, unknown>;
     expect(env.WIGOLO_BROWSER_TYPES).toBe('chromium');
   });
@@ -594,7 +594,7 @@ describe('installAgent', () => {
     // Command/args refreshed to canonical install shape.
     const entry = navigate(cfg, ['mcpServers', 'wigolo']) as Record<string, unknown>;
     expect(entry.command).toBe('npx');
-    expect(entry.args).toEqual(['-y', 'wigolo']);
+    expect(entry.args).toEqual(['-y', 'wigolo@0.2.1']);
   });
 
   it('refuses a symlinked target config — bystander file untouched', async () => {

@@ -35,6 +35,15 @@ describe('package.json: forbidden deps after Python-rerank migration', () => {
     expect(node).toBeDefined();
     expect(node).toMatch(/>=20/);
   });
+
+  it('pins security-sensitive packages to patched releases', () => {
+    expect(pkg.dependencies?.ajv).toBe('8.20.0');
+    expect(pkg.dependencies?.sharp).toBe('0.35.3');
+    expect(pkg.dependencies?.tar).toBe('7.5.21');
+    expect(pkg.overrides?.['@hono/node-server']).toBe('2.0.11');
+    expect(pkg.overrides?.sharp).toBe('0.35.3');
+    expect(pkg.overrides?.tar).toBe('7.5.21');
+  });
 });
 
 // Regression guard for GitHub issues #114 / #101 — Linux reranker symbol clash.
@@ -92,5 +101,24 @@ describe('package.json: onnxruntime-node converges via natural alignment (issues
     }
 
     expect([...versions]).toEqual(['1.21.0']);
+  });
+
+  it('resolves only patched tar and sharp versions', () => {
+    const lock = JSON.parse(
+      readFileSync(join(__dirname, '..', '..', 'package-lock.json'), 'utf-8'),
+    ) as { packages?: Record<string, { version?: string }> };
+
+    const versionsFor = (name: string): string[] => {
+      const versions = new Set<string>();
+      for (const [path, meta] of Object.entries(lock.packages ?? {})) {
+        if (path.endsWith(`node_modules/${name}`) && meta.version) {
+          versions.add(meta.version);
+        }
+      }
+      return [...versions];
+    };
+
+    expect(versionsFor('tar')).toEqual(['7.5.21']);
+    expect(versionsFor('sharp')).toEqual(['0.35.3']);
   });
 });

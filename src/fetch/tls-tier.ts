@@ -18,6 +18,11 @@ import { getConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import { anySignal } from '../util/abort.js';
 import { guardFetchUrl } from '../watch/ssrf.js';
+import {
+  createNetworkRequestGuard,
+  headersForRedirect,
+  type NetworkRequestGuard,
+} from './network-security.js';
 
 const log = createLogger('fetch');
 
@@ -33,6 +38,8 @@ export interface TlsFetchOptions {
    * HTTP-timeout + a fresh TLS-timeout (a latency blowup).
    */
   signal?: AbortSignal;
+  /** Per-fetch guard supplied by SmartRouter; checks DNS and every redirect. */
+  requestGuard?: NetworkRequestGuard;
 }
 
 export interface TlsFetchResult {
@@ -135,30 +142,6 @@ async function loadBackend(): Promise<LoadedTlsBackend> {
     }
   })();
   return _backendPromise;
-}
-
-/** Host-equality of two URLs; malformed inputs are treated as different hosts. */
-function sameHost(a: string, b: string): boolean {
-  try {
-    return new URL(a).hostname === new URL(b).hostname;
-  } catch {
-    return false;
-  }
-}
-
-/** A copy of `headers` with any Cookie entry removed (case-insensitive), or the
- *  original reference when there is nothing to strip. */
-function stripCookieHeader(
-  headers: Record<string, string> | undefined,
-): Record<string, string> | undefined {
-  if (!headers) return headers;
-  const out: Record<string, string> = {};
-  let stripped = false;
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === 'cookie') { stripped = true; continue; }
-    out[k] = v;
-  }
-  return stripped ? out : headers;
 }
 
 function headersToRecord(h: WreqHeaders | undefined): Record<string, string> {
@@ -292,6 +275,10 @@ export async function tlsFetch(url: string, options: TlsFetchOptions = {}): Prom
   const profiles = buildProfileRotation(config.tlsBrowser);
   const allowPrivate = config.fetchAllowPrivate;
   const maxHops = config.maxRedirects;
+  const requestGuard = options.requestGuard ?? createNetworkRequestGuard({
+    initialUrl: url,
+    allowPrivate,
+  });
 
   // Manual, SSRF-re-guarded redirect follower for the TLS-impersonation tier.
   // The backend would otherwise follow 3xx internally with no per-hop guard,
@@ -304,11 +291,10 @@ export async function tlsFetch(url: string, options: TlsFetchOptions = {}): Prom
     for (let hop = 0; hop <= maxHops; hop++) {
       if (seen.has(current)) throw new Error(`redirect loop at ${current}`);
       seen.add(current);
-      // Never carry a Cookie across a cross-host redirect hop — a reused,
-      // host-scoped anti-bot clearance must not leak to a different origin.
-      const hopHeaders = sameHost(url, current)
-        ? options.headers
-        : stripCookieHeader(options.headers);
+      await requestGuard(current, hop === 0 ? 'url' : 'redirect location');
+      // Caller credentials are origin-bound. A scheme, host, or port change
+      // strips all sensitive headers, not only Cookie.
+      const hopHeaders = headersForRedirect(options.headers, url, current);
       const resp = await backend.fetch(current, {
         headers: hopHeaders,
         browser,
@@ -323,6 +309,7 @@ export async function tlsFetch(url: string, options: TlsFetchOptions = {}): Prom
         if (!guard.ok) {
           throw new Error(`Redirect blocked: ${guard.reason}. ${guard.hint}`);
         }
+        await requestGuard(current, 'redirect location');
         continue;
       }
       return resp;

@@ -21,7 +21,12 @@ wigolo init
 
 ## Docker
 
-The published image is `ghcr.io/knockoutez/wigolo`. It's the slim variant: the browser engine binary and on-device models download on first use into the `/data` volume, keeping the image small and the downloads persistent.
+For a security-reviewed fork, build and run the checked-out source with the
+[hardened local Docker guide](./docker-local.md). It uses a pinned base image,
+never invokes unpinned `npx`, and includes a loopback-only authenticated Compose
+profile for Windows Docker Desktop.
+
+The upstream published image is `ghcr.io/knockoutez/wigolo`. It's the slim variant: the browser engine binary and on-device models download on first use into the `/data` volume, keeping the image small and the downloads persistent.
 
 MCP over stdio (one local client):
 
@@ -35,13 +40,15 @@ Wire it into an MCP host, e.g.:
 claude mcp add wigolo -- docker run -i --rm -v wigolo-data:/data ghcr.io/knockoutez/wigolo
 ```
 
-HTTP daemon (remote MCP + REST, `/health` endpoint, multi-client) — use the compose file at [`packaging/compose.serve.yml`](../packaging/compose.serve.yml):
+HTTP daemon (MCP + REST, `/health` endpoint, multi-client) — use the hardened compose file at [`packaging/compose.serve.yml`](../packaging/compose.serve.yml). It builds the local checkout and requires a host-session `WIGOLO_API_TOKEN`; follow the exact commands in the [local Docker guide](./docker-local.md):
 
 ```bash
-docker compose -f packaging/compose.serve.yml up
+docker compose -f packaging/compose.serve.yml up --build
 ```
 
-The compose file binds `0.0.0.0` inside the container, which is a non-loopback bind: the daemon **fails closed** and refuses to start until you set `WIGOLO_API_TOKEN` (uncomment the line in the file) or explicitly opt into open access. Details in [self-hosting](./self-hosting.md).
+The process binds `0.0.0.0` only inside the container network; Docker publishes
+it on host loopback (`127.0.0.1`) and the daemon requires a file-mounted bearer
+token. Details are in [self-hosting](./self-hosting.md).
 
 The repo's `Dockerfile` also has a `full` build target with the browser engine preinstalled at build time — useful for `--rm`/no-volume runs where first-use downloads would repeat:
 
@@ -89,7 +96,7 @@ Point it at the stdio server with this config block (this is exactly what ships 
   "mcpServers": {
     "wigolo": {
       "command": "npx",
-      "args": ["-y", "wigolo"]
+      "args": ["-y", "wigolo@0.2.1"]
     }
   }
 }

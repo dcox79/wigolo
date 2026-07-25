@@ -4,6 +4,7 @@ import { createLogger } from '../logger.js';
 import { abortRejection } from '../util/abort.js';
 import { settlePage, POST_GOTO_CAP_MS } from './settle.js';
 import type { ContentCompleteness } from '../types.js';
+import { type NetworkRequestGuard } from './network-security.js';
 
 const log = createLogger('playwright-tier');
 
@@ -63,12 +64,35 @@ export async function closeDaemonBrowser(): Promise<void> {
   if (_browser) { await _browser.close(); _browser = null; }
 }
 
-export async function fetchWithPlaywright(url: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<{ html: string; text: string; completeness: ContentCompleteness }> {
+export async function fetchWithPlaywright(url: string, opts: {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  requestGuard?: NetworkRequestGuard;
+} = {}): Promise<{ html: string; text: string; completeness: ContentCompleteness }> {
   // Bail out immediately if the caller's budget is already exhausted.
   if (opts.signal?.aborted) throw opts.signal.reason;
 
   const { context } = await getDaemonBrowser();
   const page = await context.newPage();
+  let blockedNavigationError: unknown;
+
+  // The legacy stealth helper also needs the per-request browser gate. Without
+  // this route, its redirects/subresources would bypass SmartRouter's initial
+  // URL check.
+  if (opts.requestGuard) {
+    await page.route('**/*', async (route) => {
+      const request = route.request();
+      try {
+        await opts.requestGuard?.(request.url(), 'browser request');
+        await route.continue();
+      } catch (err) {
+        if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+          blockedNavigationError = err;
+        }
+        await route.abort('blockedbyclient').catch(() => {});
+      }
+    });
+  }
 
   // When the caller's signal fires, close THIS page so the in-flight
   // navigation is cancelled. The shared daemon context is never closed here.
@@ -79,10 +103,15 @@ export async function fetchWithPlaywright(url: string, opts: { timeoutMs?: numbe
     const overall = opts.timeoutMs ?? 30000;
     // Race the navigation against the caller's abort signal.
     // abortRejection never settles when no signal is given (safe loser in race).
-    await Promise.race([
-      page.goto(url, { waitUntil: 'load', timeout: overall }),
-      abortRejection(opts.signal),
-    ]);
+    try {
+      await Promise.race([
+        page.goto(url, { waitUntil: 'load', timeout: overall }),
+        abortRejection(opts.signal),
+      ]);
+    } catch (err) {
+      if (blockedNavigationError) throw blockedNavigationError;
+      throw err;
+    }
     // A fast load can win its race while the budget is already exhausted —
     // bail before entering the post-goto waits so a never-idling SPA can't
     // hold the slot past the budget.

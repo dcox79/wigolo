@@ -1,17 +1,24 @@
-node_modules
-dist
-.git
-.github
-docs
-benchmarks
-tests
-apps
-.superpowers
-*.log
-npm-debug.log*
-.DS_Store
-coverage
-.vscode
-.idea
-CLAUDE.md
-Makefile
+# Deny by default. The Dockerfile explicitly copies only the files below, so
+# host credentials, editor/agent settings, .env files, and test artifacts cannot
+# accidentally become part of a build layer.
+*
+
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.build.json
+!tsup.config.ts
+!README.md
+!LICENSE
+!SKILL.md
+
+!src/
+!src/**
+
+!skills/
+!skills/**
+
+!assets/
+!assets/blocks/
+!assets/blocks/**
+!assets/legacy-skill-hashes.json

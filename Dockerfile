@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # =============================================================================
 # wigolo container image — two build targets:
 #   default (slim): OS libraries for the browser engine baked at build time;
@@ -8,23 +6,32 @@
 #   full:           browser binary preinstalled at build time. Larger image;
 #                   ideal for JS-render-heavy or ephemeral `--rm` runs with no
 #                   persistent volume.
-# Build the default target:  docker build --target default -t wigolo .
-# Build the full target:     docker build --target full    -t wigolo:full .
+# Build the default target:  docker build --pull --target default -t wigolo-local:reviewed .
+# Build the full target:     docker build --pull --target full -t wigolo-local:reviewed-full .
 # =============================================================================
 
+# Keep the runtime base immutable. Renovate/Dependabot (or a deliberate manual
+# review) should update this digest rather than silently taking a new image on
+# every build. This is the multi-platform digest for node:22-bookworm-slim as
+# published 2026-07-14.
+ARG NODE_IMAGE=node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3
+
 # ---- builder: compile TypeScript to dist/ ----
-FROM node:22-bookworm-slim AS builder
+FROM ${NODE_IMAGE} AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
-COPY . .
+RUN npm ci --no-audit --no-fund
+# Copy only build inputs. In particular, host credentials, agent configuration,
+# git metadata, and local .env files never enter the build stage.
+COPY tsconfig.json tsconfig.build.json tsup.config.ts ./
+COPY src/ ./src/
 RUN npm run build
 
 # ---- deps: install production node_modules once, shared by both targets ----
-FROM node:22-bookworm-slim AS deps
+FROM ${NODE_IMAGE} AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --no-audit --no-fund
 
 # ---- base: shared runtime layout with the browser engine's OS libraries baked ----
 # `playwright install-deps chromium` installs the OS shared libraries the browser
@@ -37,22 +44,38 @@ RUN npm ci --omit=dev
 #
 # No sudo in the image: the first-use deps-strategy probe treats its absence as
 # the 'skip' strategy (the baked libraries make the deps step unnecessary anyway).
-# No python either — it is only needed by the opt-in search-engine sidecar, and
-# doctor's runtime check is scoped to that backend.
+# No python either — it is only needed by the opt-in native search-engine
+# sidecar. The hardened Compose profile supplies a separate pinned container.
 # Start from a CLEAN slim base (not `FROM deps`) so node_modules lands in the
 # image exactly once, via a single --chown COPY. `FROM deps` + a second COPY +
 # `chown -R /app` would triplicate the ~750MB node_modules layer.
-FROM node:22-bookworm-slim AS base
+FROM ${NODE_IMAGE} AS base
 ENV NODE_ENV=production \
     WIGOLO_DATA_DIR=/data \
-    PLAYWRIGHT_BROWSERS_PATH=/data/browsers
+    WIGOLO_PLUGINS_DIR=/app/disabled-plugins \
+    WIGOLO_SEARCH=core \
+    PLAYWRIGHT_BROWSERS_PATH=/data/browsers \
+    HOME=/data/home \
+    XDG_CACHE_HOME=/data/xdg-cache \
+    XDG_CONFIG_HOME=/data/xdg-config \
+    XDG_STATE_HOME=/data/xdg-state \
+    TMPDIR=/tmp \
+    WIGOLO_TELEMETRY=0 \
+    WIGOLO_WARM_ENGINES=0 \
+    WIGOLO_EAGER_WARMUP=1 \
+    WIGOLO_TLS_TIER=auto \
+    WIGOLO_FETCH_ALLOW_PRIVATE=0 \
+    WIGOLO_SERVE_ALLOW_UNAUTHENTICATED=0 \
+    WIGOLO_SERVE_ALLOW_LOCAL_TARGETS=0
 WORKDIR /app
 # --chown at copy time avoids a costly `chown -R` layer that would duplicate the
 # whole node_modules tree.
-COPY --chown=node:node --from=deps /app/node_modules ./node_modules
-COPY --chown=node:node --from=builder /app/dist ./dist
-COPY --chown=node:node package.json ./
-COPY --chown=node:node skills/ ./skills/
+COPY --chown=1000:1000 --from=deps /app/node_modules ./node_modules
+COPY --chown=1000:1000 --from=builder /app/dist ./dist
+COPY --chown=1000:1000 package.json README.md LICENSE SKILL.md ./
+COPY --chown=1000:1000 skills/ ./skills/
+COPY --chown=1000:1000 assets/blocks/ ./assets/blocks/
+COPY --chown=1000:1000 assets/legacy-skill-hashes.json ./assets/legacy-skill-hashes.json
 # Bake the browser engine's OS libraries via the LOCAL playwright CLI (already in
 # node_modules) so the version matches the runtime and no throwaway playwright is
 # downloaded. install-deps runs apt-get itself (we are root at build time).
@@ -61,14 +84,21 @@ RUN ./node_modules/.bin/playwright install-deps chromium \
 
 # Writable location for the local cache, on-device models, browser binary, and
 # encrypted keys. The volume persists all of these across container runs.
-RUN mkdir -p /data/browsers && chown node:node /data /data/browsers
+RUN install -d -o 1000 -g 1000 -m 0700 \
+      /data \
+      /data/browsers \
+      /data/home \
+      /data/xdg-cache \
+      /data/xdg-config \
+      /data/xdg-state
 VOLUME ["/data"]
 
 # stdio MCP server by default. No image-level HEALTHCHECK: the default command
 # speaks the stdio MCP protocol and exposes no HTTP endpoint, so a baked
 # healthcheck would mark every container permanently unhealthy. For `serve` mode
 # use packaging/compose.serve.yml, which adds a daemon HTTP healthcheck.
-ENTRYPOINT ["node", "dist/index.js"]
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["node", "/app/dist/index.js"]
 CMD ["mcp"]
 
 # ---- default: slim image, browser binary + models download on first use ----
@@ -76,7 +106,7 @@ FROM base AS default
 LABEL org.opencontainers.image.title="wigolo" \
       org.opencontainers.image.description="Local-first web intelligence MCP server. The browser engine binary and on-device models download on first use into the /data volume." \
       org.opencontainers.image.source="https://github.com/KnockOutEZ/wigolo"
-USER node
+USER 1000:1000
 
 # ---- full: browser binary preinstalled at build for --rm / no-volume use ----
 FROM base AS full
@@ -87,7 +117,8 @@ LABEL org.opencontainers.image.title="wigolo" \
 # JS-render works with no first-use download and no volume. Installed as root,
 # then made readable by the node user.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
+USER root
 RUN mkdir -p /opt/browsers \
     && ./node_modules/.bin/playwright install chromium \
     && chown -R node:node /opt/browsers
-USER node
+USER 1000:1000

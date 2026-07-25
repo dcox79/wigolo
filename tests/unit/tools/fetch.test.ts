@@ -223,6 +223,39 @@ describe('handleFetch', () => {
     expect(result.cached_at).toBe(knownFetchedAt);
   });
 
+  it('never reads or writes the URL-only cache for authenticated requests', async () => {
+    vi.mocked(getCachedContent).mockReturnValue(makeCached({ markdown: 'PRIVATE OLD ROW' }));
+    extractMock.mockResolvedValue(makeExtraction({ markdown: 'Authenticated live response' }));
+    const router = mockRouter({ method: 'browser', cacheable: false });
+
+    const result = await handleFetch({
+      url: 'https://example.com/account',
+      use_auth: true,
+      include_full_markdown: true,
+    }, router);
+
+    expect(result.ok).toBe(true);
+    expect(getCachedContent).not.toHaveBeenCalled();
+    expect(router.fetch).toHaveBeenCalledOnce();
+    expect(cacheContent).not.toHaveBeenCalled();
+    expect(detectChange).not.toHaveBeenCalled();
+    if (result.ok) expect(result.data.markdown).toContain('Authenticated live response');
+  });
+
+  it('never shares cache entries for caller credential headers', async () => {
+    vi.mocked(getCachedContent).mockReturnValue(makeCached());
+    extractMock.mockResolvedValue(makeExtraction());
+    const router = mockRouter({ cacheable: false });
+
+    await handleFetch({
+      url: 'https://example.com/api',
+      headers: { Authorization: 'Bearer secret' },
+    }, router);
+
+    expect(getCachedContent).not.toHaveBeenCalled();
+    expect(cacheContent).not.toHaveBeenCalled();
+  });
+
   it('returns cached: false when freshly fetched', async () => {
     extractMock.mockResolvedValue(makeExtraction());
 

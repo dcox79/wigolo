@@ -13,6 +13,7 @@ import { buildEvidenceFromMarkdown } from '../search/evidence.js';
 import { resolveMode } from '../util/mode.js';
 import { createLogger } from '../logger.js';
 import { guardFetchUrl } from '../watch/ssrf.js';
+import { sharedCacheRequestIsSafe } from '../fetch/network-security.js';
 
 const log = createLogger('fetch');
 
@@ -200,11 +201,22 @@ export async function handleFetch(
     };
   }
 
+  // The cache key is URL-only. Authenticated/header-credentialed/action-driven
+  // requests and local/private-network fetches must never read from or write to
+  // that shared namespace.
+  const sharedCacheSafe = sharedCacheRequestIsSafe({
+    url: input.url!,
+    allowPrivate: getConfig().fetchAllowPrivate,
+    useAuth: input.use_auth,
+    headers: input.headers,
+    hasActions: Boolean(input.actions?.length),
+  });
+
   try {
     // Stealth mode is the retry-past-a-block escape hatch: it must always
     // fetch fresh, never replay a stale cached row (which may carry a
     // previously-cached anti-bot 403 body). Treat it like force_refresh.
-    if (!input.force_refresh && mode !== 'stealth') {
+    if (sharedCacheSafe && !input.force_refresh && mode !== 'stealth') {
       const cached = getCachedContent(input.url);
       if (cached && (!input.actions || input.actions.length === 0)) {
         const staleMaxSeconds = mode === 'cache' ? getConfig().fastStaleMaxHours * 3600 : 0;
@@ -293,25 +305,28 @@ export async function handleFetch(
       pdfBuffer: raw.rawBuffer,
     });
 
+    const responseMayBeShared = sharedCacheSafe && raw.cacheable !== false;
     let changeResult: { changed: boolean; previousHash?: string; diffSummary?: string } | undefined;
     try {
       // Pass the upstream status code so a 200→404 transition
       // (or vice-versa) is reported as changed even when the body hash
       // happens to match — the previous implementation was status-blind.
-      changeResult = detectChange(raw.finalUrl, extraction.markdown, raw.statusCode);
+      if (responseMayBeShared) {
+        changeResult = detectChange(raw.finalUrl, extraction.markdown, raw.statusCode);
+      }
     } catch (err) {
       log.warn('change detection failed', { url: raw.finalUrl, error: String(err) });
     }
 
     try {
-      cacheContent(raw, extraction);
+      if (responseMayBeShared) cacheContent(raw, extraction);
     } catch (err) {
       log.warn('failed to cache fetched content', { url: raw.finalUrl, error: String(err) });
     }
 
     try {
       const embeddingService = getEmbeddingService();
-      if (embeddingService.isAvailable()) {
+      if (responseMayBeShared && embeddingService.isAvailable()) {
         embeddingService.embedAsync(raw.finalUrl, extraction.markdown);
       }
     } catch (err) {

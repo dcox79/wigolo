@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import { isProcessAlive } from './process.js';
@@ -9,6 +9,11 @@ import { resolvePythonExe, venvBinPath, checkVenvModule, isMissingVenvModuleErro
 import { resolveContainerCli } from './docker.js';
 
 const log = createLogger('searxng');
+
+// Immutable upstream source reviewed on 2026-07-22. Keep the commit and archive
+// digest together; updates must deliberately change both values.
+export const SEARXNG_SOURCE_COMMIT = '6da6eee265daeb4a62ab638d6921522bf405de69';
+export const SEARXNG_SOURCE_SHA256 = 'b5309793f7c0d72c2076af1200b42bcc67b11669884b704eb15d2f55e8834f20';
 
 export interface BootstrapState {
   status: 'downloading' | 'ready' | 'failed' | 'no_runtime';
@@ -344,8 +349,9 @@ export async function bootstrapNativeSearxng(dataDir: string): Promise<void> {
     mkdirSync(repoDir, { recursive: true });
     const tarPath = join(searxngDir, 'searxng.tar.gz');
 
-    log.info('downloading SearXNG source');
-    const response = await fetch('https://github.com/searxng/searxng/archive/refs/heads/master.tar.gz');
+    log.info('downloading pinned SearXNG source', { commit: SEARXNG_SOURCE_COMMIT });
+    const sourceUrl = `https://github.com/searxng/searxng/archive/${SEARXNG_SOURCE_COMMIT}.tar.gz`;
+    const response = await fetch(sourceUrl);
     if (!response.ok) {
       throw new BootstrapError({
         stderr: `SearXNG download failed: ${response.status} ${response.statusText}`,
@@ -353,7 +359,16 @@ export async function bootstrapNativeSearxng(dataDir: string): Promise<void> {
         command: 'fetch searxng.tar.gz',
       });
     }
-    writeFileSync(tarPath, Buffer.from(await response.arrayBuffer()));
+    const archive = Buffer.from(await response.arrayBuffer());
+    const actualDigest = createHash('sha256').update(archive).digest('hex');
+    if (actualDigest !== SEARXNG_SOURCE_SHA256) {
+      throw new BootstrapError({
+        stderr: `SearXNG archive integrity mismatch: expected ${SEARXNG_SOURCE_SHA256}, got ${actualDigest}`,
+        exitCode: null,
+        command: `fetch ${sourceUrl}`,
+      });
+    }
+    writeFileSync(tarPath, archive);
     runStep('tar', ['xzf', tarPath, '--strip-components=1', '-C', repoDir], { timeout: 60_000 });
 
     runStep(pip, ['install', '-r', join(repoDir, 'requirements.txt')], { timeout: 300_000 });

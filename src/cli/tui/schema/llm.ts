@@ -28,8 +28,8 @@ export const llmCategory: CategoryDef = {
       label: 'API key',
       kind: 'masked',
       secret: true,
-      propagateToAgents: true,
-      help: 'Stored in OS keychain when available; never written to config.json.',
+      propagateToAgents: false,
+      help: 'Stored in the OS keychain or encrypted file; never copied into agent config files.',
       // Ollama is keyless — hide the API-key field when it's the chosen provider
       // so the wizard never prompts for a credential the local server ignores.
       visible: (ctx) => (ctx.pending.llmProvider ?? ctx.current.llmProvider) !== 'ollama',

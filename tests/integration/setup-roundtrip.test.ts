@@ -10,8 +10,8 @@
  * the unit tests had mocked the persist function entirely.
  *
  * Test A: proves persistKey writes a nested JSON shape (not flat dotted keys).
- * Test B: proves the real save() fans the API key out to an agent env block on
- *         disk and never writes the raw key value into config.json.
+ * Test B: proves the real save() keeps the API key out of agent configs and
+ *         config.json while retaining it in the protected secret store.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
@@ -61,7 +61,7 @@ describe('fresh-machine setup round-trip', () => {
     expect(raw['settings.llmProvider']).toBeUndefined();
   });
 
-  it('API key fans out to an agent env block on disk via the real save() path', async () => {
+  it('API key stays out of agent config files via the real save() path', async () => {
     // This is the regression guard for the 0.1.23 bug: exercise the REAL
     // propagation save (not a mocked persistKey). Build a temp agent target
     // pointing at a temp config file, stage the secret, save, then read the
@@ -113,14 +113,11 @@ describe('fresh-machine setup round-trip', () => {
     // No errors or save failures
     expect(res.errors ?? []).toHaveLength(0);
     expect(res.failed).toHaveLength(0);
-    expect(res.propagated).toContain('claude-code');
+    expect(res.propagated).not.toContain('claude-code');
 
-    // The agent file on disk must carry the key in its env block.
-    // Shape per applyPropagationToAgent (propagation.ts:481-486):
-    //   envBlock = root['mcpServers']['wigolo']['env']
-    //   envBlock['WIGOLO_LLM_API_KEY'] = 'sk-roundtrip-123'
+    // Agent configuration must never receive the raw key.
     const agentRaw = JSON.parse(readFileSync(agentFile, 'utf-8'));
-    expect(agentRaw.mcpServers.wigolo.env.WIGOLO_LLM_API_KEY).toBe('sk-roundtrip-123');
+    expect(JSON.stringify(agentRaw)).not.toContain('sk-roundtrip-123');
     // Sanity: the rest of the agent entry is preserved
     expect(agentRaw.mcpServers.wigolo.command).toBe('npx');
 

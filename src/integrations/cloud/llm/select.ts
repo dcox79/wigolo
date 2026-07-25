@@ -86,6 +86,12 @@ export async function selectProviderWithKeyStore(
     const p = explicit as LLMProvider;
     const key = await resolveProviderKey(p, opts);
     if (key) return { provider: p, key };
+    // Wizard-created generic keys predate the provider-specific keystore. They
+    // are encrypted/keychain-backed and are safe to consult only when a single
+    // provider was explicitly selected, so the key cannot be misattributed.
+    const { defaultSecretStore } = await import('../../../cli/tui/state/secret-store.js');
+    const wizardKey = await defaultSecretStore({ dataDir: opts.dataDir }).get('llmApiKey');
+    if (wizardKey) return { provider: p, key: wizardKey };
     // Explicit provider specified but key not found — fall through to auto-detect
   }
 

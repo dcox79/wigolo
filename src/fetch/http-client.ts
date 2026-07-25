@@ -2,6 +2,11 @@ import { getConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import { anySignal } from '../util/abort.js';
 import { guardFetchUrl } from '../watch/ssrf.js';
+import {
+  createNetworkRequestGuard,
+  headersForRedirect,
+  type NetworkRequestGuard,
+} from './network-security.js';
 
 export interface HttpFetchOptions {
   headers?: Record<string, string>;
@@ -18,6 +23,8 @@ export interface HttpFetchOptions {
    * targets stay blocked regardless.
    */
   allowPrivate?: boolean;
+  /** Per-fetch guard supplied by SmartRouter; also checks every redirect hop. */
+  requestGuard?: NetworkRequestGuard;
 }
 
 export interface HttpFetchResult {
@@ -36,16 +43,6 @@ const PDF_MAGIC = '%PDF-';
 
 function bufferLooksLikePdf(buf: Buffer): boolean {
   return buf.length >= PDF_MAGIC.length && buf.subarray(0, PDF_MAGIC.length).toString('latin1') === PDF_MAGIC;
-}
-
-/** True when both URLs resolve to the same hostname (host-equality, not eTLD+1).
- *  Malformed inputs are treated as different hosts (fail closed). */
-function isSameHost(a: string, b: string): boolean {
-  try {
-    return new URL(a).hostname === new URL(b).hostname;
-  } catch {
-    return false;
-  }
 }
 
 const RETRYABLE_STATUSES = new Set([429, 502, 503]);
@@ -92,6 +89,10 @@ export async function httpFetch(url: string, options: HttpFetchOptions = {}): Pr
   const timeoutMs = options.timeoutMs ?? config.fetchTimeoutMs;
   const maxRedirects = config.maxRedirects;
   const allowPrivate = options.allowPrivate ?? config.fetchAllowPrivate;
+  const requestGuard = options.requestGuard ?? createNetworkRequestGuard({
+    initialUrl: url,
+    allowPrivate,
+  });
   const external = options.signal;
 
   let lastError: unknown;
@@ -106,7 +107,15 @@ export async function httpFetch(url: string, options: HttpFetchOptions = {}): Pr
     }
 
     try {
-      const result = await fetchWithRedirects(url, options, timeoutMs, maxRedirects, allowPrivate, logger);
+      const result = await fetchWithRedirects(
+        url,
+        options,
+        timeoutMs,
+        maxRedirects,
+        allowPrivate,
+        requestGuard,
+        logger,
+      );
       return result;
     } catch (err) {
       if (external?.aborted) throw external.reason;
@@ -147,6 +156,7 @@ async function fetchWithRedirects(
   timeoutMs: number,
   maxRedirects: number,
   allowPrivate: boolean,
+  requestGuard: NetworkRequestGuard,
   logger: ReturnType<typeof createLogger>,
 ): Promise<HttpFetchResult> {
   const visited = new Set<string>();
@@ -159,6 +169,10 @@ async function fetchWithRedirects(
     }
     visited.add(currentUrl);
 
+    // This is the last gate before the socket is opened. It runs for the
+    // initial URL and every redirect, including hostname DNS answers.
+    await requestGuard(currentUrl, redirectCount === 0 ? 'url' : 'redirect location');
+
     logger.debug('fetching', { url: currentUrl, attempt: redirectCount });
 
     const timeout = AbortSignal.timeout(timeoutMs);
@@ -170,14 +184,8 @@ async function fetchWithRedirects(
     let response: Response;
     try {
       const ua = getRotatingUserAgent(getConfig());
-      const mergedHeaders: Record<string, string> = { 'User-Agent': ua, ...options.headers };
-      // Never carry a Cookie across a cross-host redirect hop. A reused anti-bot
-      // clearance cookie is host-scoped; leaking it to a different host on a 3xx
-      // would send a credential to an unintended origin.
-      if (!isSameHost(originalUrl, currentUrl)) {
-        delete mergedHeaders['Cookie'];
-        delete mergedHeaders['cookie'];
-      }
+      const hopHeaders = headersForRedirect(options.headers, originalUrl, currentUrl);
+      const mergedHeaders: Record<string, string> = { 'User-Agent': ua, ...hopHeaders };
       // Conditional GET: inject If-None-Match / If-Modified-Since so the
       // server can return 304 + no body when the resource hasn't changed.
       // Callers (eg. etag-incremental crawl) wire these from the persisted
@@ -243,6 +251,10 @@ async function fetchWithRedirects(
           false,
         );
       }
+      // DNS/private classification is async, so validate before the next loop
+      // iteration opens a socket. Keeping this adjacent to the legacy literal
+      // guard makes redirect security explicit even if the loop is refactored.
+      await requestGuard(currentUrl, 'redirect location');
       continue;
     }
 

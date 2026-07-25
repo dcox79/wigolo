@@ -141,6 +141,16 @@ describe('selectProviderWithKeyStore', () => {
       expect(result?.key).toBe('gm-key');
     });
 
+    it('uses the protected wizard key only for the explicitly persisted provider', async () => {
+      const { defaultSecretStore } = await import('../../../src/cli/tui/state/secret-store.js');
+      await defaultSecretStore({ dataDir: tmpDir }).set('llmApiKey', 'wizard-key');
+      writeConfig('anthropic');
+
+      const result = await selectProviderWithKeyStore(process.env, { dataDir: tmpDir });
+      expect(result).toEqual({ provider: 'anthropic', key: 'wizard-key' });
+      expect(process.env.WIGOLO_LLM_API_KEY).toBeUndefined();
+    });
+
     it('WIGOLO_LLM_PROVIDER env wins over config.json llmProvider', async () => {
       await storeKey('gemini', 'gm-key', { dataDir: tmpDir });
       await storeKey('openai', 'oa-key', { dataDir: tmpDir });

@@ -306,7 +306,7 @@ export async function extractPaletteFromBuffer(
     return null;
   }
 
-  let raw: { data: Buffer; info: sharp.OutputInfo };
+  let raw: { data: Buffer; info: { channels: number } };
   try {
     raw = await sharp(buffer, {
       failOn: 'none',

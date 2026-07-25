@@ -21,7 +21,7 @@ describe('applyConfigs round-trip', () => {
     const results = await applyConfigs(agents, ['cursor']);
     expect(results[0].ok).toBe(true);
     const content = JSON.parse(readFileSync(join(dir, 'cursor', 'mcp.json'), 'utf-8'));
-    expect(content.mcpServers.wigolo).toEqual({ command: 'npx', args: ['-y', 'wigolo'] });
+    expect(content.mcpServers.wigolo).toEqual({ command: 'npx', args: ['-y', 'wigolo@0.2.1'] });
   });
 
   it('merges into existing Zed settings without losing other keys', async () => {
@@ -42,7 +42,7 @@ describe('applyConfigs round-trip', () => {
     expect(content.theme).toBe('One Dark');
     expect(content.buffer_font_size).toBe(14);
     expect(content.context_servers.existing).toEqual({ command: 'foo', args: ['bar'] });
-    expect(content.context_servers.wigolo).toEqual({ command: 'npx', args: ['-y', 'wigolo'] });
+    expect(content.context_servers.wigolo).toEqual({ command: 'npx', args: ['-y', 'wigolo@0.2.1'] });
   });
 
   it('writes Codex TOML correctly', async () => {
@@ -55,7 +55,7 @@ describe('applyConfigs round-trip', () => {
     expect(results[0].ok).toBe(true);
     const parsed = parseToml(readFileSync(path, 'utf-8')) as any;
     expect(parsed.mcp_servers.wigolo.command).toBe('npx');
-    expect(parsed.mcp_servers.wigolo.args).toEqual(['-y', 'wigolo']);
+    expect(parsed.mcp_servers.wigolo.args).toEqual(['-y', 'wigolo@0.2.1']);
   });
 
   it('writes VS Code config with type:stdio', async () => {

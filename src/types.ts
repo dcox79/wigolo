@@ -185,6 +185,12 @@ export interface RawFetchResult {
   escalated?: boolean;
   warning?: string;
   /**
+   * False when the response came from an authenticated, action-driven, or
+   * local/private-network request. Such responses must never enter the shared
+   * URL-only cache or its embedding index.
+   */
+  cacheable?: boolean;
+  /**
    * How completely a browser-tier capture rendered — set by the playwright /
    * stealth paths from the shared settle. Absent on HTTP/TLS captures and cache
    * rows that predate the field. Downstream (cache staleness, research source

@@ -45,15 +45,14 @@ describe('llmCategory', () => {
     expect(key?.visible?.({ current: { llmProvider: 'ollama' }, pending: {} })).toBe(false);
   });
 
-  it('api key is masked + secret + propagates to agents', () => {
+  it('api key is masked + secret and is never copied into agent configs', () => {
     const key = llmCategory.fields.find((f) => f.settingsPath === 'llmApiKey');
     expect(key).toBeDefined();
     expect(key?.kind).toBe('masked');
     expect(key?.secret).toBe(true);
-    expect(key?.propagateToAgents).toBe(true);
+    expect(key?.propagateToAgents).toBe(false);
     expect(key?.key).toBe('WIGOLO_LLM_API_KEY');
-    // Help text must mention the keychain so users understand where secrets land.
-    expect(key?.help).toMatch(/keychain/i);
+    expect(key?.help).toMatch(/keychain|encrypted/i);
   });
 
   it('llmBaseUrl field is removed — the custom endpoint URL field no longer exists in the schema', () => {

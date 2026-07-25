@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { runCommand } from './run-command.js';
 import { mergeMcpJson } from '../agents/utils.js';
+import { getPinnedServerCommand } from './server-command.js';
 
 export interface InstallViaClaudeCliArgs {
   dryRun?: boolean;
@@ -17,14 +18,12 @@ export interface InstallViaClaudeCliResult {
   fallbackPath?: string;
 }
 
-const SERVER_CMD = 'npx';
-const SERVER_ARGS = ['-y', 'wigolo'];
-
 function writeClaudeJsonFallback(): InstallViaClaudeCliResult {
+  const server = getPinnedServerCommand();
   const fallbackPath = join(homedir(), '.claude.json');
   mergeMcpJson(
     fallbackPath,
-    { command: SERVER_CMD, args: [...SERVER_ARGS] },
+    { command: server.command, args: server.args },
     ['mcpServers', 'wigolo'],
   );
   return {
@@ -43,9 +42,10 @@ export async function installViaClaudeCli(args: InstallViaClaudeCliArgs = {}): P
 
   let r;
   try {
+    const server = getPinnedServerCommand();
     r = await runCommand(
       'claude',
-      ['mcp', 'add', 'wigolo', '--scope', 'user', '--', SERVER_CMD, ...SERVER_ARGS],
+      ['mcp', 'add', 'wigolo', '--scope', 'user', '--', server.command, ...server.args],
       { timeout: 15000 },
     );
   } catch (err) {

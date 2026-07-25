@@ -27,7 +27,7 @@ WantedBy=multi-user.target
 
 **tmux/screen** (quick and dirty): `tmux new -d -s wigolo 'npx wigolo serve'`.
 
-**Docker Compose**: use [`packaging/compose.serve.yml`](../packaging/compose.serve.yml) — it ships with a healthcheck, a persistent volume, and the token wiring commented inline. See [installation](./installation.md#docker).
+**Docker Compose**: use [`packaging/compose.serve.yml`](../packaging/compose.serve.yml) — it builds the checked-out source and applies a non-root, read-only, loopback-published profile with a healthcheck, persistent volume, and mandatory secret-file token. Follow the [hardened local Docker guide](./docker-local.md).
 
 ## Binding beyond loopback
 

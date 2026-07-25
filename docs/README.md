@@ -10,6 +10,7 @@ Everything the server returns is transparent: per-result evidence scores, per-en
 | --- | --- |
 | [Getting started](./getting-started.md) | The 5-minute path: `npx wigolo init`, wire an agent, run your first search. |
 | [Installation](./installation.md) | Every install channel — npm, Docker, MCP bundle, registries — plus the agent auto-wire matrix and uninstall. |
+| [Hardened local Docker](./docker-local.md) | Build the reviewed checkout and run it non-root, read-only, loopback-only, and bearer-authenticated on Docker Desktop. |
 | [Configuration](./configuration.md) | Resolution order, the settings TUI, and grouped env-var tables for search, fetch, models, LLM providers, cache, and serve. |
 | [Tools](./tools.md) | The 10 tools with parameters, response fields, and worked examples. |
 | [CLI](./cli.md) | Full command reference: management commands, one-shot tools, the interactive shell, and the `--json` contract. |

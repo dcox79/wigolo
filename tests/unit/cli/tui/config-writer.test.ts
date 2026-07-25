@@ -46,7 +46,7 @@ describe('applyConfigs', () => {
     expect(writeJsonConfig).toHaveBeenCalledWith(expect.objectContaining({
       path: '/proj/.cursor/mcp.json',
       keyPath: ['mcpServers', 'wigolo'],
-      entry: expect.objectContaining({ command: 'npx', args: ['-y', 'wigolo'] }),
+      entry: expect.objectContaining({ command: 'npx', args: ['-y', 'wigolo@0.2.1'] }),
     }));
   });
 

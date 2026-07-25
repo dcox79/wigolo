@@ -1,4 +1,5 @@
 import { mkdirSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 // Type-only: the runtime module is dynamic-imported inside getModel() so the
 // native ONNX runtime is NOT mapped into the process at boot (D2 idle-footprint
@@ -10,6 +11,31 @@ import { getConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('embedding');
+const requireFromHere = createRequire(import.meta.url);
+
+type TarCompatModule = Record<string, unknown> & {
+  default?: unknown;
+  x?: unknown;
+};
+
+/**
+ * fastembed@2.1.0 imports tar as a CommonJS-style default, but the first tar
+ * release containing the current extraction fixes (7.5.19+) exposes named
+ * exports only. Load fastembed's CommonJS entry after supplying that legacy
+ * default shape so it can call the patched tar.x implementation.
+ *
+ * Remove this adapter when fastembed ships native tar 7 support.
+ */
+export function loadFastembedWithPatchedTar(): typeof import('fastembed') {
+  const tarModule = requireFromHere('tar') as TarCompatModule;
+  if (typeof tarModule.x !== 'function') {
+    throw new Error('The installed tar package does not expose the required x() extractor');
+  }
+  if (tarModule.default === undefined) {
+    tarModule.default = tarModule;
+  }
+  return requireFromHere('fastembed') as typeof import('fastembed');
+}
 
 /**
  * Ensure the fastembed model cache dir (and any missing parents) exists, then
@@ -96,7 +122,8 @@ export class FastembedEmbedProvider implements EmbedProvider {
     log.info('Loading embedding model', { modelId: this.modelId });
     const dataDir = getConfig().dataDir;
     const cacheDir = ensureFastembedCacheDir(dataDir);
-    this.modelPromise = import('fastembed')
+    this.modelPromise = Promise.resolve()
+      .then(() => loadFastembedWithPatchedTar())
       .then(({ FlagEmbedding, EmbeddingModel }) =>
         initModelWithArchiveRetry(
           () => FlagEmbedding.init({ model: EmbeddingModel.BGESmallENV15, cacheDir }),

@@ -427,14 +427,14 @@ async function fetchSources(
       const truncated = truncateSmartly(extraction.markdown, PER_SOURCE_CHAR_CAP);
 
       try {
-        cacheContent(raw, extraction);
+        if (raw.cacheable !== false) cacheContent(raw, extraction);
       } catch (err) {
         log.warn('failed to cache research source', { url: result.url, error: String(err) });
       }
 
       try {
         const embeddingService = getEmbeddingService();
-        if (embeddingService.isAvailable()) {
+        if (raw.cacheable !== false && embeddingService.isAvailable()) {
           embeddingService.embedAsync(raw.finalUrl, extraction.markdown);
         }
       } catch (err) {

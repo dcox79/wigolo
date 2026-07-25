@@ -20,10 +20,6 @@ vi.mock('../../../src/cache/store.js', () => ({
   isExpired: vi.fn(),
 }));
 
-vi.mock('../../../src/fetch/playwright-tier.js', () => ({
-  fetchWithPlaywright: vi.fn(),
-}));
-
 vi.mock('../../../src/logger.js', () => ({
   createLogger: () => ({
     debug: vi.fn(),
@@ -38,7 +34,6 @@ import { extractMetadata, extractSelector, extractTables } from '../../../src/ex
 import { getCachedContent, isExpired } from '../../../src/cache/store.js';
 import { extractWithSchema } from '../../../src/extraction/schema.js';
 import { extractJsonLd } from '../../../src/extraction/jsonld.js';
-import { fetchWithPlaywright } from '../../../src/fetch/playwright-tier.js';
 
 function mockRouter(html = '<html><body>Hello</body></html>') {
   return {
@@ -392,16 +387,22 @@ describe('handleExtract execution_mode:stealth', () => {
     vi.mocked(isExpired).mockReturnValue(false);
   });
 
-  it('uses fetchWithPlaywright and bypasses cache + router for stealth tables extraction', async () => {
-    vi.mocked(fetchWithPlaywright).mockResolvedValue({
+  it('routes stealth extraction through SmartRouter so the central network guard applies', async () => {
+    const router = {
+      fetch: vi.fn().mockResolvedValue({
+        url: 'https://js-page.test/',
+        finalUrl: 'https://js-page.test/',
       html: '<table><tr><th>a</th></tr><tr><td>1</td></tr></table>',
-      text: '',
-    } as any);
+        contentType: 'text/html',
+        statusCode: 200,
+        method: 'browser',
+        headers: {},
+      }),
+      getDomainStats: vi.fn(),
+    };
     vi.mocked(extractTables).mockReturnValue([
       { caption: undefined, headers: ['a'], rows: [{ a: '1' }] },
     ]);
-
-    const router = { fetch: vi.fn(), getDomainStats: vi.fn() };
 
     const __r_out = await handleExtract(
       { url: 'https://js-page.test/', mode: 'tables', execution_mode: 'stealth' } as any,
@@ -410,8 +411,7 @@ describe('handleExtract execution_mode:stealth', () => {
     const out = __r_out.ok ? __r_out.data : ({ ...__r_out } as any);
 
     expect(getCachedContent).not.toHaveBeenCalled();
-    expect(router.fetch).not.toHaveBeenCalled();
-    expect(fetchWithPlaywright).toHaveBeenCalledWith('https://js-page.test/');
+    expect(router.fetch).toHaveBeenCalledWith('https://js-page.test/', { mode: 'stealth' });
     expect(Array.isArray(out.data)).toBe(true);
     expect((out.data as any[]).length).toBe(1);
     expect(out.error).toBeUndefined();

@@ -2,9 +2,7 @@ import type { AgentId, DetectedAgent } from './agents.js';
 import { writeJsonConfig, type WriteJsonConfigResult } from './config-writer-json.js';
 import { writeTomlConfig, type WriteTomlConfigResult } from './config-writer-toml.js';
 import { installViaClaudeCli, type InstallViaClaudeCliResult } from './config-writer-cli.js';
-
-const SERVER_COMMAND = 'npx';
-const SERVER_ARGS = ['-y', 'wigolo'];
+import { getPinnedServerCommand } from './server-command.js';
 
 interface JsonAgentSpec {
   keyPath: string[];
@@ -40,7 +38,8 @@ export interface ApplyConfigsOptions {
 }
 
 function buildEntry(extra?: Record<string, unknown>): Record<string, unknown> {
-  return { command: SERVER_COMMAND, args: [...SERVER_ARGS], ...(extra ?? {}) };
+  const server = getPinnedServerCommand();
+  return { command: server.command, args: server.args, ...(extra ?? {}) };
 }
 
 type ResultBase = { id: AgentId; displayName: string; configPath: string | null };

@@ -305,7 +305,7 @@ async function fetchPages(
       });
 
       try {
-        cacheContent(raw, extraction);
+        if (raw.cacheable !== false) cacheContent(raw, extraction);
       } catch (err) {
         log.debug('failed to cache agent source', { url, error: String(err) });
       }

@@ -369,6 +369,34 @@ describe('httpFetch', () => {
       expect(seen[0]).toBe('cf_clearance=SECRET');
       expect(seen[1]).toBe('cf_clearance=SECRET');
     });
+
+    it('strips every caller credential on a cross-origin redirect', async () => {
+      const received: http.IncomingHttpHeaders[] = [];
+      otherServer = await startServer((req, res) => {
+        received.push(req.headers);
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<html>other origin</html>');
+      });
+      hostServer = await startServer((_req, res) => {
+        res.writeHead(302, { location: `http://localhost:${getPort(otherServer)}/landing` });
+        res.end();
+      });
+
+      await httpFetch(`http://127.0.0.1:${getPort(hostServer)}/start`, {
+        allowPrivate: true,
+        headers: {
+          Authorization: 'Bearer TOP-SECRET',
+          Cookie: 'session=TOP-SECRET',
+          'X-Api-Key': 'TOP-SECRET',
+          Accept: 'text/html',
+        },
+      });
+
+      expect(received[0].authorization).toBeUndefined();
+      expect(received[0].cookie).toBeUndefined();
+      expect(received[0]['x-api-key']).toBeUndefined();
+      expect(received[0].accept).toBe('text/html');
+    });
   });
 
   describe('connection errors', () => {

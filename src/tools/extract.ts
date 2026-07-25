@@ -10,7 +10,6 @@ import { extractJsonLd } from '../extraction/jsonld.js';
 import { extractStructured, mergeGridTables } from '../extraction/structured.js';
 import { detectDivGridTables } from '../extraction/div-grid.js';
 import { getCachedContent, isExpired } from '../cache/store.js';
-import { fetchWithPlaywright } from '../fetch/playwright-tier.js';
 import { countTokens, truncateByTokens } from '../search/tokens.js';
 import { createLogger } from '../logger.js';
 import {
@@ -24,6 +23,7 @@ import { extractBrandAsync } from '../extraction/brand.js';
 import { applyEvidenceFilter, getSourceText } from '../extraction/schema-truth.js';
 import { guardFetchUrl } from '../watch/ssrf.js';
 import { getConfig } from '../config.js';
+import { sharedCacheRequestIsSafe } from '../fetch/network-security.js';
 
 const log = createLogger('extract');
 
@@ -322,8 +322,9 @@ async function resolveHtml(
   router: SmartRouter,
 ): Promise<{ html: string; sourceUrl?: string }> {
   if (input.execution_mode === 'stealth' && input.url) {
-    const pw = await fetchWithPlaywright(input.url);
-    return { html: pw.html, sourceUrl: input.url };
+    const raw = await router.fetch(input.url, { mode: 'stealth' });
+    if ('error' in raw) throw new Error(raw.error_reason);
+    return { html: raw.html, sourceUrl: raw.finalUrl };
   }
 
   if (input.url) {
@@ -340,10 +341,16 @@ async function resolveHtml(
       });
     }
 
-    const cached = getCachedContent(input.url);
-    if (cached && !isExpired(cached)) {
-      log.info('Using cached HTML', { url: input.url });
-      return { html: cached.rawHtml, sourceUrl: cached.url };
+    const sharedCacheSafe = sharedCacheRequestIsSafe({
+      url: input.url,
+      allowPrivate: getConfig().fetchAllowPrivate,
+    });
+    if (sharedCacheSafe) {
+      const cached = getCachedContent(input.url);
+      if (cached && !isExpired(cached)) {
+        log.info('Using cached HTML', { url: input.url });
+        return { html: cached.rawHtml, sourceUrl: cached.url };
+      }
     }
 
     const raw = await router.fetch(input.url, {

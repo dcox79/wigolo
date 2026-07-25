@@ -44,6 +44,12 @@ import { BrowserAcquirer, BROWSER_INSTALLING_NOTE, BROWSER_UNAVAILABLE_ERROR } f
 import { anySignal } from '../util/abort.js';
 import { guardFetchUrl } from '../watch/ssrf.js';
 import type { RawFetchResult, BrowserAction, Mode, StageError, ContentCompleteness } from '../types.js';
+import {
+  createNetworkRequestGuard,
+  sharedCacheRequestIsSafe,
+  type DnsLookup,
+  type NetworkRequestGuard,
+} from './network-security.js';
 
 // Domains we know up-front are heavily client-rendered. HTTP-first detection
 // keeps mis-classifying these (react.dev SSRs enough nav text to clear the
@@ -116,6 +122,7 @@ export interface HttpClient {
         ifModifiedSince?: string;
       };
       signal?: AbortSignal;
+      requestGuard?: NetworkRequestGuard;
     },
   ): Promise<{
     url: string;
@@ -142,6 +149,7 @@ export interface BrowserFetchArgs {
   signal?: AbortSignal;
   stealth?: boolean;
   injectedCookies?: Array<{ name: string; value: string; domain: string; path?: string }>;
+  requestGuard?: NetworkRequestGuard;
 }
 
 export interface BrowserPoolInterface {
@@ -157,12 +165,17 @@ export interface BrowserPoolInterface {
 
 export type HttpFetcher = (
   url: string,
-  options?: { headers?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal },
+  options?: {
+    headers?: Record<string, string>;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    requestGuard?: NetworkRequestGuard;
+  },
 ) => Promise<{ url: string; html: string; text: string }>;
 
 export type PlaywrightFetcher = (
   url: string,
-  options?: { timeoutMs?: number; signal?: AbortSignal },
+  options?: { timeoutMs?: number; signal?: AbortSignal; requestGuard?: NetworkRequestGuard },
 ) => Promise<{ html: string; text: string; completeness: ContentCompleteness }>;
 
 /**
@@ -172,7 +185,12 @@ export type PlaywrightFetcher = (
  */
 export type TlsFetcher = (
   url: string,
-  options?: { headers?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal },
+  options?: {
+    headers?: Record<string, string>;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    requestGuard?: NetworkRequestGuard;
+  },
 ) => Promise<TlsFetchResult>;
 
 /**
@@ -180,7 +198,11 @@ export type TlsFetcher = (
  * content-type or magic-bytes). Injectable so router tests don't hit the
  * network. Defaults to {@link defaultPdfProbe}.
  */
-export type PdfProbe = (url: string, signal?: AbortSignal) => Promise<boolean>;
+export type PdfProbe = (
+  url: string,
+  signal?: AbortSignal,
+  requestGuard?: NetworkRequestGuard,
+) => Promise<boolean>;
 
 /** Pluggable hooks to learning/persistence layer so router tests don't need a DB. */
 export interface TlsRoutingPersistence {
@@ -232,6 +254,8 @@ export interface SmartRouterOptions {
    * install never loads the module.
    */
   escapeHatch?: EscapeHatchFetchers;
+  /** DNS seam for the shared network guard (primarily for deterministic tests). */
+  dnsLookup?: DnsLookup;
 }
 
 /** The two escape-hatch rung fetchers, injectable for tests. */
@@ -295,12 +319,20 @@ export function looksLikePdfResult(result: { contentType?: string; rawBuffer?: B
  * timeout so it adds minimal latency and can only run when we are already about
  * to pay a browser cold-start.
  */
-export async function defaultPdfProbe(url: string, signal?: AbortSignal): Promise<boolean> {
+export async function defaultPdfProbe(
+  url: string,
+  signal?: AbortSignal,
+  requestGuard?: NetworkRequestGuard,
+): Promise<boolean> {
   const probeTimeoutMs = 3000;
   const timeout = AbortSignal.timeout(probeTimeoutMs);
   const combined = signal ? anySignal([signal, timeout]) : { signal: timeout, cleanup: () => {} };
   const allowPrivate = getConfig().fetchAllowPrivate;
   const maxHops = getConfig().maxRedirects;
+  const networkGuard = requestGuard ?? createNetworkRequestGuard({
+    initialUrl: url,
+    allowPrivate,
+  });
 
   // Manual, SSRF-re-guarded redirect follower. `redirect:'follow'` would let a
   // public URL 302 the probe onto a private/metadata target; instead we follow
@@ -316,6 +348,7 @@ export async function defaultPdfProbe(url: string, signal?: AbortSignal): Promis
     for (let hop = 0; hop <= maxHops; hop++) {
       if (seen.has(current)) return null;
       seen.add(current);
+      await networkGuard(current, hop === 0 ? 'url' : 'redirect location');
       const resp = await fetch(current, { ...init, redirect: 'manual', signal: combined.signal });
       if (resp.status >= 300 && resp.status < 400) {
         const loc = resp.headers.get('location');
@@ -323,6 +356,7 @@ export async function defaultPdfProbe(url: string, signal?: AbortSignal): Promis
         try { await resp.arrayBuffer(); } catch { /* drain */ }
         current = new URL(loc, current).toString();
         if (!guardFetchUrl(current, 'redirect location', { allowPrivate }).ok) return null;
+        await networkGuard(current, 'redirect location');
         continue;
       }
       return resp;
@@ -464,6 +498,7 @@ export class SmartRouter {
   private readonly browserAcquirer: BrowserAcquirer;
   private readonly clearanceStore: ClearanceStore;
   private readonly escapeHatchOverride: EscapeHatchFetchers | undefined;
+  private readonly dnsLookup: DnsLookup | undefined;
 
   constructor(httpClient: HttpClient, browserPool: BrowserPoolInterface);
   constructor(options: SmartRouterOptions);
@@ -485,7 +520,8 @@ export class SmartRouter {
         'tlsPersistence' in httpClientOrOptions ||
         'clearanceStore' in httpClientOrOptions ||
         'pdfProbe' in httpClientOrOptions ||
-        'escapeHatch' in httpClientOrOptions)
+        'escapeHatch' in httpClientOrOptions ||
+        'dnsLookup' in httpClientOrOptions)
     ) {
       const opts = httpClientOrOptions as SmartRouterOptions;
       if (!opts.httpFetcher && !opts.httpClient) {
@@ -501,6 +537,7 @@ export class SmartRouter {
       this.browserAcquirer = opts.browserAcquirer ?? new BrowserAcquirer();
       this.clearanceStore = opts.clearanceStore ?? defaultClearanceStore();
       this.escapeHatchOverride = opts.escapeHatch;
+      this.dnsLookup = opts.dnsLookup;
       return;
     } else {
       // Backwards-compat: single HttpClient positional (unusual but safe)
@@ -513,6 +550,7 @@ export class SmartRouter {
     this.pdfProbe = defaultPdfProbe;
     this.browserAcquirer = new BrowserAcquirer();
     this.clearanceStore = defaultClearanceStore();
+    this.dnsLookup = undefined;
   }
 
   /**
@@ -574,13 +612,19 @@ export class SmartRouter {
       timeoutMs?: number;
       conditionalHeaders?: RouterFetchOptions['conditionalHeaders'];
       signal?: AbortSignal;
+      requestGuard?: NetworkRequestGuard;
     },
   ): Promise<Awaited<ReturnType<HttpClient['fetch']>>> {
     if (!this.httpClient) throw new Error('SmartRouter: httpClient not configured');
     let host: string | null = null;
     try { host = new URL(url).hostname; } catch { host = null; }
     const headers = host ? this.withClearanceHeader(host, 'http', opts.headers) : opts.headers;
-    return this.httpClient.fetch(url, { ...opts, headers });
+    const requestGuard = opts.requestGuard ?? createNetworkRequestGuard({
+      initialUrl: url,
+      allowPrivate: getConfig().fetchAllowPrivate,
+      lookup: this.dnsLookup,
+    });
+    return this.httpClient.fetch(url, { ...opts, headers, requestGuard });
   }
 
   private makeDefaultHttpFetcher(): HttpFetcher {
@@ -605,7 +649,13 @@ export class SmartRouter {
   private async browserOrHttpForBinary(
     url: string,
     domain: string,
-    opts: { headers?: Record<string, string>; screenshot?: boolean; conditionalHeaders?: RouterFetchOptions['conditionalHeaders']; signal?: AbortSignal },
+    opts: {
+      headers?: Record<string, string>;
+      screenshot?: boolean;
+      conditionalHeaders?: RouterFetchOptions['conditionalHeaders'];
+      signal?: AbortSignal;
+      requestGuard?: NetworkRequestGuard;
+    },
     logger: ReturnType<typeof createLogger>,
   ): Promise<RawFetchResult | StageError> {
     const { headers, screenshot, conditionalHeaders, signal } = opts;
@@ -614,14 +664,14 @@ export class SmartRouter {
     if (!looksLikeBinaryDownload(url)) {
       let isPdf = false;
       try {
-        isPdf = await this.pdfProbe(url, signal);
+        isPdf = await this.pdfProbe(url, signal, opts.requestGuard);
       } catch {
         isPdf = false;
       }
       if (isPdf) {
         if (!this.httpClient) throw new Error('SmartRouter: httpClient not configured');
         logger.debug('content-type probe identified a PDF, routing to http instead of browser', { url, domain });
-        const result = await this.httpClientFetch(url, { headers, conditionalHeaders, signal });
+        const result = await this.httpClientFetch(url, { headers, conditionalHeaders, signal, requestGuard: opts.requestGuard });
         this.ensureStats(domain);
         return this.toRawFetchResult(result);
       }
@@ -633,6 +683,7 @@ export class SmartRouter {
       headers,
       screenshot,
       signal,
+      requestGuard: opts.requestGuard,
       stealth: stealthForBrowser(getConfig(), { antiBotEscalation: false }),
     });
   }
@@ -659,6 +710,11 @@ export class SmartRouter {
     if (!this.browserPool) throw new Error('SmartRouter: browserPool not configured');
 
     const { fallback, ...browserOptions } = options;
+    browserOptions.requestGuard ??= createNetworkRequestGuard({
+      initialUrl: url,
+      allowPrivate: getConfig().fetchAllowPrivate,
+      lookup: this.dnsLookup,
+    });
     const acquired = await this.browserAcquirer.ensureBrowser();
     if (acquired !== 'ready') {
       const logger = createLogger('fetch');
@@ -787,6 +843,38 @@ export class SmartRouter {
     url: string,
     options: RouterFetchOptions = {},
   ): Promise<RawFetchResult | StageError> {
+    const config = getConfig();
+    const requestGuard = createNetworkRequestGuard({
+      initialUrl: url,
+      allowPrivate: config.fetchAllowPrivate,
+      lookup: this.dnsLookup,
+    });
+
+    // Central entry guard: every caller (fetch, agent, crawl, stealth, cache
+    // refresh) reaches this check before any tier is selected.
+    const initialDecision = await requestGuard(url, 'url');
+    const result = await this.fetchRouted(url, options, requestGuard);
+    if ('error' in result) return result;
+
+    // Custom/injected test clients may not consume requestGuard, so validate
+    // the reported terminal URL too. Real tiers additionally guard each hop
+    // immediately before opening a socket.
+    const finalDecision = await requestGuard(result.finalUrl, 'final URL');
+    result.cacheable = sharedCacheRequestIsSafe({
+      url,
+      allowPrivate: config.fetchAllowPrivate,
+      useAuth: options.useAuth,
+      headers: options.headers,
+      hasActions: Boolean(options.actions?.length),
+    }) && !initialDecision.privateNetwork && !finalDecision.privateNetwork;
+    return result;
+  }
+
+  private async fetchRouted(
+    url: string,
+    options: RouterFetchOptions,
+    requestGuard: NetworkRequestGuard,
+  ): Promise<RawFetchResult | StageError> {
     const { renderJs = 'auto', useAuth = false, headers, screenshot, actions, mode, conditionalHeaders, signal } = options;
     const config = getConfig();
     const logger = createLogger('fetch');
@@ -804,7 +892,7 @@ export class SmartRouter {
         return stealthBackoff;
       }
       logger.debug('routing to stealth (static then escalate)', { url });
-      const staticResult = await this.httpFetcher(url, { headers, signal });
+      const staticResult = await this.httpFetcher(url, { headers, signal, requestGuard });
       this.ensureStats(domain);
       // Escalate on thin content (shouldEscalate) OR on a challenge shell. The
       // /enable javascript/i shell already trips shouldEscalate, but a
@@ -847,7 +935,7 @@ export class SmartRouter {
         });
       }
       try {
-        const pw = await this.playwrightFetcher(url, { signal });
+        const pw = await this.playwrightFetcher(url, { signal, requestGuard });
         return {
           url: staticResult.url,
           finalUrl: staticResult.url,
@@ -987,7 +1075,12 @@ export class SmartRouter {
 
     if (stats.preferPlaywright) {
       logger.debug('routing to playwright (domain marked)', { url, domain });
-      return this.browserOrHttpForBinary(url, domain, { headers, screenshot, conditionalHeaders, signal }, logger);
+      return this.browserOrHttpForBinary(
+        url,
+        domain,
+        { headers, screenshot, conditionalHeaders, signal, requestGuard },
+        logger,
+      );
     }
 
     // Decide whether to try the TLS-impersonation tier
@@ -1374,9 +1467,14 @@ export class SmartRouter {
     // different JA3 may still be re-challenged — that surfaces as an anti-bot
     // signal below and escalates normally.
     const tlsHeaders = this.withClearanceHeader(domain, 'tls', headers);
+    const requestGuard = createNetworkRequestGuard({
+      initialUrl: url,
+      allowPrivate: getConfig().fetchAllowPrivate,
+      lookup: this.dnsLookup,
+    });
     let r: TlsFetchResult;
     try {
-      r = await this.tlsFetcher(url, { headers: tlsHeaders, signal });
+      r = await this.tlsFetcher(url, { headers: tlsHeaders, signal, requestGuard });
     } catch (err) {
       if (err instanceof TlsTierUnavailableError) {
         logger.debug('tls tier unavailable, escalating', { url, domain });

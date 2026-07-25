@@ -37,6 +37,7 @@ import { createLogger } from '../../../logger.js';
 import type { CategoryDef, FieldDef } from '../schema/types.js';
 import type { SettingsStore } from './settings-store.js';
 import type { AgentTarget } from './agent-targets.js';
+import { getPinnedServerCommand } from '../server-command.js';
 
 const log = createLogger('cli');
 
@@ -493,8 +494,8 @@ async function applyPropagationToAgent(
 // keys), writes a backup first, and refuses to follow symlinks.
 //
 // The command/args shape is the canonical install recipe used by the SP7
-// agent handlers: `npx -y wigolo` so the agent boots wigolo via
-// npx regardless of global install state.
+// agent handlers: an exact-version `npx -y wigolo@<version>` command so the
+// agent never drifts to an unreviewed future `latest` release.
 // ---------------------------------------------------------------------------
 
 export interface InstallAgentOpts {
@@ -541,8 +542,9 @@ export async function installAgent(opts: InstallAgentOpts): Promise<InstallAgent
 
   // Ensure the server entry exists at target.serverPath.
   const serverEntry = ensureNested(root, opts.target.serverPath);
-  serverEntry.command = 'npx';
-  serverEntry.args = ['-y', 'wigolo'];
+  const server = getPinnedServerCommand();
+  serverEntry.command = server.command;
+  serverEntry.args = server.args;
 
   // Merge env: ensure the env block exists, preserve unrelated keys, overwrite
   // anything the caller passed in. Empty `env` is a valid no-op merge.

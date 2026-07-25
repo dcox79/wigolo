@@ -17,6 +17,10 @@ import { resolveStealthUA, stealthLaunchArgs, stealthContextOptions, STEALTH_INI
 import { recordDomainClearance, clearDomainClearance } from '../cache/store.js';
 import { CLEARANCE_COOKIE_NAME, clearanceExpiresIso } from './clearance-reuse.js';
 import type { RawFetchResult, BrowserType, ActionResult, BrowserAction } from '../types.js';
+import {
+  headersForRedirect,
+  type NetworkRequestGuard,
+} from './network-security.js';
 
 /**
  * Host of a fetched URL, or null on a malformed URL. Used to key the anti-bot
@@ -96,6 +100,8 @@ export interface BrowserFetchOptions {
    * challenge is replayed instead of re-solved.
    */
   injectedCookies?: Array<{ name: string; value: string; domain: string; path?: string }>;
+  /** Guard invoked immediately before every document/subresource request. */
+  requestGuard?: NetworkRequestGuard;
 }
 
 export interface BrowserPoolOptions {
@@ -531,7 +537,38 @@ export class MultiBrowserPool {
       page.on('download', (dl) => { capturedDownload = dl; });
     }
 
-    if (options.headers) {
+    // A page-level route is the browser tier's last gate before Chromium opens
+    // a connection. It protects redirects AND subresources (a public document
+    // can otherwise embed an internal URL), and injects caller headers only
+    // under the origin policy below. Avoid setExtraHTTPHeaders here: Playwright
+    // applies those headers to every origin, including cross-origin redirects.
+    let blockedNavigationError: unknown;
+    const pageWithRoute = page as typeof page & {
+      route?: typeof page.route;
+    };
+    if (typeof pageWithRoute.route === 'function' && (options.requestGuard || options.headers)) {
+      await pageWithRoute.route('**/*', async (route) => {
+        const request = route.request();
+        const requestUrl = request.url();
+        try {
+          await options.requestGuard?.(requestUrl, 'browser request');
+        } catch (err) {
+          if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+            blockedNavigationError = err;
+          }
+          await route.abort('blockedbyclient').catch(() => {});
+          return;
+        }
+
+        const callerHeaders = headersForRedirect(options.headers, url, requestUrl);
+        const requestHeaders = request.headers();
+        await route.continue({
+          headers: callerHeaders ? { ...requestHeaders, ...callerHeaders } : requestHeaders,
+        });
+      });
+    } else if (options.headers) {
+      // Unit-test page stubs may not implement route(). Production Playwright
+      // pages always do; retain the old fallback solely for those stubs.
       await page.setExtraHTTPHeaders(options.headers);
     }
 
@@ -569,6 +606,7 @@ export class MultiBrowserPool {
           contentType = rawHeaders['content-type'] ?? '';
         }
       } catch (err) {
+        if (blockedNavigationError) throw blockedNavigationError;
         // A PDF (or other binary) response makes Chromium reject goto with
         // "Download is starting" and/or fire a download event. Don't hard-error
         // — read the downloaded bytes and return them as a buffered result so

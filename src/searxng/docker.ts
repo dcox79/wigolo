@@ -5,7 +5,9 @@ import { createLogger } from '../logger.js';
 const log = createLogger('searxng');
 
 const CONTAINER_NAME = 'wigolo-searxng';
-const IMAGE = 'searxng/searxng:latest';
+// Pin the multi-architecture OCI index rather than following mutable `latest`.
+// Reviewed 2026-07-22; update deliberately after checking the upstream image.
+const IMAGE = 'searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812';
 
 // wigolo shells out to whichever `docker`-compatible CLI is on PATH — it
 // never talks to the Docker Engine API directly, so any CLI that implements
