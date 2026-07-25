@@ -231,14 +231,14 @@ function summaryFor(tool: ToolName): string {
   return sanitize(firstLine);
 }
 
-/** Full route description; capability-sanitized, with the search degradation note. */
+/** Full route description; capability-sanitized, with the REST synthesis note. */
 function descriptionFor(tool: ToolName): string {
   let desc = sanitize(TOOL_DESCRIPTIONS[tool]);
   if (tool === 'search') {
     desc +=
-      '\n\nOver REST, `format: \'answer\'` degrades to keyless evidence synthesis: ' +
-      'there is no client LLM sampling channel, so the server returns the assembled ' +
-      'evidence rather than a sampled natural-language answer.';
+      '\n\nOver REST, `format: \'answer\'` uses the server-side LLM provider when one ' +
+      'is configured. REST has no client LLM sampling channel, so if server-side ' +
+      'synthesis is unavailable the response falls back to assembled evidence.';
   }
   return desc;
 }

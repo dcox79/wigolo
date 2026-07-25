@@ -122,8 +122,8 @@ async function dispatchFetch(input: FetchInput, ctx: DispatchContext): Promise<D
 
 async function dispatchSearch(input: SearchInput, ctx: DispatchContext): Promise<DispatchResult> {
   const { searchEngines, router, backendStatus } = ctx.subsystems;
-  // Serve mode carries no LLM sampling client; format:'answer' degrades to the
-  // keyless ladder inside the handler.
+  // Serve mode has no client sampling channel, but the handler can still use a
+  // configured server-side LLM before falling back to assembled evidence.
   const r = await handleSearch(input, searchEngines, router, backendStatus, undefined as unknown as SamplingCapableServer);
   if (!r.ok) return stageFailure(r);
   const remap = statusForSearchData(r.data as { error?: unknown; warning?: unknown });
@@ -180,8 +180,8 @@ async function dispatchFindSimilar(input: FindSimilarInput, ctx: DispatchContext
 
 async function dispatchResearch(input: ResearchInput, ctx: DispatchContext): Promise<DispatchResult> {
   const { searchEngines, router, backendStatus } = ctx.subsystems;
-  // Serve mode carries no LLM sampling client; synthesis degrades to the
-  // keyless ladder inside the handler.
+  // Serve mode has no client sampling channel; configured server-side LLMs and
+  // the handler's keyless/evidence fallbacks remain available.
   const r = await handleResearch(input, searchEngines, router, backendStatus, undefined);
   if (!r.ok) return stageFailure(r);
   return { status: 200, body: r.data };

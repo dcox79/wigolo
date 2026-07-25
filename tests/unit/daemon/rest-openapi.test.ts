@@ -111,10 +111,11 @@ describe('OpenAPI document assembly', () => {
     }
   });
 
-  it('notes the format:answer degradation in the search route description', () => {
+  it('documents REST server-side synthesis and its evidence fallback', () => {
     const doc = buildOpenApi() as { paths: Record<string, { post: { description: string } }> };
     const desc = doc.paths['/v1/search'].post.description.toLowerCase();
-    expect(desc).toContain('degrade');
+    expect(desc).toContain('server-side llm');
+    expect(desc).toContain('no client llm sampling channel');
     expect(desc).toContain('evidence');
   });
 
