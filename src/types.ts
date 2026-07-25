@@ -1035,7 +1035,8 @@ export type NamedSchemaType =
   | 'Product'
   | 'CodeSnippet'
   | 'Paper'
-  | 'EventListing';
+  | 'EventListing'
+  | 'JobPosting';
 
 export interface ExtractInput {
   url?: string;

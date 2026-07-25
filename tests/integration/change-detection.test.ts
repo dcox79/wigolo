@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import * as http from 'node:http';
 import * as fs from 'node:fs';
 import { join } from 'node:path';
@@ -10,7 +10,16 @@ import { httpFetch } from '../../src/fetch/http-client.js';
 import { handleFetch } from '../../src/tools/fetch.js';
 import { handleCache } from '../../src/tools/cache.js';
 import { initDatabase, closeDatabase, getDatabase } from '../../src/cache/db.js';
+import { getCachedContent } from '../../src/cache/store.js';
 import type { FetchInput } from '../../src/types.js';
+
+// The fixture is served from loopback, which production intentionally excludes
+// from the shared URL-only cache. Model a cacheable public response here so this
+// suite exercises change detection without weakening the private-cache policy.
+vi.mock('../../src/fetch/network-security.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/fetch/network-security.js')>();
+  return { ...actual, sharedCacheRequestIsSafe: () => true };
+});
 
 const FIXTURES_DIR = join(import.meta.dirname, '..', 'fixtures', 'changing-page');
 
@@ -64,6 +73,12 @@ describe('Change Detection Integration', () => {
     pool = new BrowserPool();
     const httpClient = { fetch: (url: string, options?: { headers?: Record<string, string>; timeoutMs?: number }) => httpFetch(url, options) };
     router = new SmartRouter(httpClient, pool);
+    const routedFetch = router.fetch.bind(router);
+    router.fetch = async (...args: Parameters<SmartRouter['fetch']>) => {
+      const result = await routedFetch(...args);
+      if (!('error' in result)) result.cacheable = true;
+      return result;
+    };
     currentVersion = 'v1';
   });
 
@@ -105,6 +120,54 @@ describe('Change Detection Integration', () => {
 
     expect(result.cached).toBe(false);
     expect(result.changed).toBeUndefined();
+  }, 15000);
+
+  it('section fetch preserves the canonical full-page cache and does not create a false deletion diff', async () => {
+    const url = `http://127.0.0.1:${port}/doc`;
+    const baseInput: FetchInput = {
+      url,
+      render_js: 'never',
+      include_full_markdown: true,
+    };
+
+    const firstResult = await handleFetch(baseInput, router);
+    expect(firstResult.ok).toBe(true);
+    if (!firstResult.ok) return;
+
+    const fullMarkdown = firstResult.data.markdown;
+    const fullHash = firstResult.data.content_hash;
+    expect(fullMarkdown).toContain('Installation');
+    expect(fullMarkdown).toContain('Configuration');
+    expect(fullMarkdown).toContain('Usage');
+
+    const sectionResult = await handleFetch({
+      ...baseInput,
+      section: 'Installation',
+      force_refresh: true,
+    }, router);
+
+    expect(sectionResult.ok).toBe(true);
+    if (!sectionResult.ok) return;
+    expect(sectionResult.data.markdown).toContain('Installation');
+    expect(sectionResult.data.markdown).not.toContain('Configuration');
+    expect(sectionResult.data.metadata.section_matched).toBe(true);
+    expect(sectionResult.data.changed).toBeUndefined();
+    expect(sectionResult.data.diff_summary).toBeUndefined();
+    expect(sectionResult.data.content_hash).toBe(fullHash);
+
+    const cached = getCachedContent(url);
+    expect(cached?.markdown).toBe(fullMarkdown);
+    expect(cached?.contentHash).toBe(fullHash);
+
+    const cachedOtherSection = await handleFetch({
+      ...baseInput,
+      section: 'Configuration',
+    }, router);
+    expect(cachedOtherSection.ok).toBe(true);
+    if (!cachedOtherSection.ok) return;
+    expect(cachedOtherSection.data.cached).toBe(true);
+    expect(cachedOtherSection.data.markdown).toContain('Configuration');
+    expect(cachedOtherSection.data.markdown).not.toContain('Installation');
   }, 15000);
 
   it('detects change when page content is updated', async () => {

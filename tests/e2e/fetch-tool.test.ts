@@ -1,13 +1,21 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import { handleFetch } from '../../src/tools/fetch.js';
 import { SmartRouter, type HttpClient, type BrowserPoolInterface } from '../../src/fetch/router.js';
 import { ChallengeBlockedError } from '../../src/fetch/browser-pool.js';
 import { httpFetch } from '../../src/fetch/http-client.js';
 import { initDatabase, closeDatabase } from '../../src/cache/db.js';
 import { resetConfig } from '../../src/config.js';
+
+// The fixture server is loopback-only, which production intentionally excludes
+// from the shared URL cache. Model a public, cacheable response so these E2E
+// cases continue to exercise cache reads without weakening that policy.
+vi.mock('../../src/fetch/network-security.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/fetch/network-security.js')>();
+  return { ...actual, sharedCacheRequestIsSafe: () => true };
+});
 
 const FIXTURE_PATH = join(import.meta.dirname, '..', 'fixtures', 'extraction', 'article.html');
 const FIXTURE_HTML = readFileSync(FIXTURE_PATH, 'utf-8');
@@ -72,6 +80,12 @@ describe('e2e: fetch tool', () => {
     resetConfig();
     initDatabase(':memory:');
     router = createRouter();
+    const routedFetch = router.fetch.bind(router);
+    router.fetch = async (...args: Parameters<SmartRouter['fetch']>) => {
+      const result = await routedFetch(...args);
+      if (!('error' in result)) result.cacheable = true;
+      return result;
+    };
   });
 
   it('full fetch returns title, markdown, metadata, and links', async () => {
