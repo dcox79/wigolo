@@ -253,8 +253,9 @@ export async function runSearxngSearch(
         excludeDomains: input.exclude_domains,
         fromDate: input.from_date,
         toDate: input.to_date,
-        category: input.category,
-      },
+          category: input.category,
+          signal: ctx.signal,
+        },
     );
 
     const filterTargetMq = (input.language ?? 'en').slice(0, 2).toLowerCase();
@@ -325,6 +326,7 @@ export async function runSearxngSearch(
         totalDeadline: start + totalTimeoutMs,
         forceRefresh: input.force_refresh ?? false,
         maxFetches: input.max_fetches,
+        signal: ctx.signal,
       });
       fetchElapsed = Date.now() - fetchStart;
     }
@@ -441,46 +443,30 @@ export async function runSearxngSearch(
     }
   }
 
-  const subQueries = decomposeQuery(queryStr);
+  // The legacy single-string path used to build an unrestricted
+  // engine-by-subquery Promise.all. Normalize and cap decomposition first,
+  // then reuse the same abort-aware bounded dispatcher as array queries.
+  const subQueries = normalizeQueries(decomposeQuery(queryStr));
   log.debug('query decomposition', { original: queryStr, parts: subQueries.length });
 
   const effectiveEngines = mode === 'cache' ? activeEngines.slice(0, 1) : activeEngines;
 
   await emit(1, 5, `Running ${subQueries.length} search queries across ${effectiveEngines.length} engines...`);
 
-  const allRaw: RawSearchResult[] = [];
-  const enginesUsed = new Set<string>();
-  const errors: string[] = [];
-
-  const hasFilterAttrition = !!(input.include_domains?.length || input.exclude_domains?.length);
-  const overfetchFactor = hasFilterAttrition ? 3 : 2;
-
-  const searchPromises = effectiveEngines.flatMap(engine =>
-    subQueries.map(async (query) => {
-      try {
-        const results = await engine.search(query, {
-          maxResults: maxResults * overfetchFactor,
-          timeRange: input.time_range,
-          language: input.language,
-          includeDomains: input.include_domains,
-          excludeDomains: input.exclude_domains,
-          fromDate: input.from_date,
-          toDate: input.to_date,
-          category: input.category,
-        });
-        for (const r of results) {
-          allRaw.push(r);
-          enginesUsed.add(engine.name);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log.warn('engine search failed', { engine: engine.name, query, error: msg });
-        errors.push(`${engine.name}: ${msg}`);
-      }
-    }),
-  );
-
-  await Promise.allSettled(searchPromises);
+  const fanout = await fanOutSearch(subQueries, effectiveEngines, {
+    maxResults,
+    timeRange: input.time_range,
+    language: input.language,
+    includeDomains: input.include_domains,
+    excludeDomains: input.exclude_domains,
+    fromDate: input.from_date,
+    toDate: input.to_date,
+    category: input.category,
+    signal: ctx.signal,
+  });
+  const allRaw: RawSearchResult[] = fanout.results;
+  const enginesUsed = new Set(fanout.enginesUsed);
+  const errors = fanout.errors;
 
   const filterTargetSq = (input.language ?? 'en').slice(0, 2).toLowerCase();
   const filteredSq = filterByLanguageWithFallback(allRaw, {
@@ -550,6 +536,7 @@ export async function runSearxngSearch(
       totalDeadline: start + totalTimeoutMs,
       forceRefresh: input.force_refresh ?? false,
       maxFetches: input.max_fetches,
+      signal: ctx.signal,
     });
     fetchElapsed = Date.now() - fetchStart;
   }
@@ -598,4 +585,3 @@ export async function runSearxngSearch(
   }
   return { ok: true, data: output };
 }
-

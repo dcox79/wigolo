@@ -111,6 +111,50 @@ describe('TransformersRerankProvider (mocked runtime)', () => {
   });
 });
 
+describe('TransformersRerankProvider idle lifecycle', () => {
+  it('disposes the model after the configured idle period and reloads it on demand', async () => {
+    vi.useFakeTimers();
+    const dispose = vi.fn(async () => undefined);
+    const tokenizer = vi.fn((queries: string[]) => ({
+      __pairs: queries.map((q) => ({ q, d: 'document' })),
+    }));
+    const model = Object.assign(
+      vi.fn(async () => ({
+        logits: { data: new Float32Array([0.5]), dims: [1, 1] },
+      })),
+      { dispose },
+    );
+    const load = vi.fn(async () => ({ tokenizer, model }));
+    const provider = new TransformersRerankProvider({
+      idleTimeoutMs: 30,
+      load: load as never,
+    });
+
+    try {
+      await provider.rerank('query', [{ id: 'a', text: 'document' }]);
+      expect(provider.getRuntimeState()).toMatchObject({
+        state: 'ready',
+        loaded: true,
+        idle_timeout_ms: 30,
+      });
+
+      await vi.advanceTimersByTimeAsync(30);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(provider.getRuntimeState()).toMatchObject({
+        state: 'unloaded',
+        loaded: false,
+        unload_count: 1,
+      });
+
+      await provider.rerank('query', [{ id: 'b', text: 'document' }]);
+      expect(load).toHaveBeenCalledTimes(2);
+    } finally {
+      await provider.dispose();
+      vi.useRealTimers();
+    }
+  });
+});
+
 // Gated runtime test (real model download).  Only runs when explicitly
 // requested because it pulls ~22MB from huggingface.co.
 describe.skipIf(!process.env.RUN_TRANSFORMERS)('TransformersRerankProvider (real model)', () => {

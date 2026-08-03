@@ -44,8 +44,8 @@ wigolo config --cleanup cache              # cache|embeddings|models|browser|sea
 | `BRAVE_API_KEY` | unset | Enables the optional Brave engines (general + images). |
 | `WIGOLO_GITHUB_TOKEN` | unset | Authenticates the GitHub code-search engine (higher rate limit, private-org hydration). |
 | `WIGOLO_RSS_FEEDS` | unset | Comma-separated feed URLs mixed into news-category results. |
-| `WIGOLO_MULTI_QUERY_MAX` | `10` | Cap on query variants accepted in one array-query search. |
-| `WIGOLO_MULTI_QUERY_CONCURRENCY` | `5` | How many variants dispatch in parallel. |
+| `WIGOLO_MULTI_QUERY_MAX` | `5` | Cap on query variants after automatic rewrites are added. |
+| `WIGOLO_MULTI_QUERY_CONCURRENCY` | `2` | How many variants dispatch in parallel. |
 
 What the backends mean:
 
@@ -88,7 +88,9 @@ For fetching pages behind a login with your own browser session: `WIGOLO_CDP_URL
 | --- | --- | --- |
 | `WIGOLO_RERANKER` | `onnx` | Result reranking: `onnx` (the bundled on-device ranking model), `none`, or `custom`. |
 | `WIGOLO_RERANKER_MODEL` | `bge-reranker-v2-m3` | Which ranking model to load. |
+| `WIGOLO_RERANKER_IDLE_TIMEOUT_MS` | `300000` | Idle ms before the in-process reranker session is unloaded. It reloads on the next rerank. |
 | `WIGOLO_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model for the semantic cache index and `find_similar`. |
+| `WIGOLO_EMBEDDING_IDLE_TIMEOUT` | `1800000` | Idle ms before the in-process embedding session is unloaded. It reloads on the next embedding request. |
 | `WIGOLO_RELEVANCE_THRESHOLD` | `0` | Drop search results below this reranker score (0 = keep all). |
 
 Models download once (during `init`/`warmup` or lazily on first use) and run fully in-process — no external services.
@@ -142,6 +144,8 @@ Per-call `force_refresh: true` skips both and goes to the network. `wigolo cache
 | `WIGOLO_SERVE_HEADERS_TIMEOUT_MS` | `60000` | Header-receipt timeout. |
 
 Full endpoint + auth semantics — including the opt-in [compat shim](./rest-api.md#compat-shim) — in [REST API](./rest-api.md) and [self-hosting](./self-hosting.md).
+
+Authenticated `GET /v1/diagnostics` reports read-only process memory, model lifecycle state, browser capacity, and per-engine breaker/admission state (`inFlight`, queued calls, and `nextAllowedAt`). It never includes credentials or request content.
 
 ## Telemetry
 

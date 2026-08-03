@@ -46,6 +46,7 @@ import {
 import { getConfig } from '../../config.js';
 import { createLogger } from '../../logger.js';
 import type { Citation } from '../../types.js';
+import { anySignal } from '../../util/abort.js';
 
 const log = createLogger('search');
 
@@ -53,6 +54,57 @@ const DEFAULT_CONTENT_MAX_CHARS = 30000;
 const DEFAULT_MAX_TOTAL_CHARS = 50000;
 
 const RRF_K = 60;
+
+function abortError(signal?: AbortSignal): Error {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error('Search aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+/** Ordered, bounded worker queue. Active jobs receive the same signal through
+ * runV1Search; queued jobs are never started after cancellation. */
+async function mapBounded<T, R>(
+  values: T[],
+  concurrency: number,
+  signal: AbortSignal | undefined,
+  worker: (value: T, index: number, signal: AbortSignal) => Promise<R>,
+): Promise<R[]> {
+  if (values.length === 0) return [];
+  const results = new Array<R>(values.length);
+  let cursor = 0;
+  let failed = false;
+  const workerCount = Math.min(values.length, Math.max(1, Math.floor(concurrency)));
+  const siblingController = new AbortController();
+  const combined = signal
+    ? anySignal([signal, siblingController.signal])
+    : undefined;
+  const queueSignal = combined?.signal ?? siblingController.signal;
+
+  const runWorker = async (): Promise<void> => {
+    while (true) {
+      if (failed || queueSignal.aborted) throw abortError(queueSignal);
+      const index = cursor++;
+      if (index >= values.length) return;
+      try {
+        results[index] = await worker(values[index], index, queueSignal);
+      } catch (err) {
+        failed = true;
+        siblingController.abort(
+          err instanceof Error ? err : new Error(String(err)),
+        );
+        throw err;
+      }
+    }
+  };
+
+  try {
+    await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+    return results;
+  } finally {
+    combined?.cleanup();
+  }
+}
 
 // Per-result damp for an error-intent result that mentions none of the query's
 // atomic error tokens. Strong enough to sink broadcaster/dictionary junk below
@@ -260,6 +312,13 @@ export class CoreSearchProvider implements SearchProvider {
     // single-query call (multi-query callers already supplied their own
     // variants — we trust them).
     const autoRewrites: string[] = [];
+    const config = getConfig();
+    const maxQueryVariants = Math.max(1, Math.floor(config.multiQueryMax || 5));
+    const queryConcurrency = Math.max(1, Math.floor(config.multiQueryConcurrency || 2));
+    // Shared across every variant and any recursive vertical fallback. The
+    // orchestrator claims this synchronously before starting recovery, so even
+    // concurrent variants can launch at most one recovery wave per request.
+    const recoveryBudget = { claimed: false };
     // Every query actually dispatched to the orchestrator (user query/queries
     // plus any concurrent auto-variant — rare-term, entity-qualified,
     // low-recall expansion). Surfaced as SearchOutput.queries_executed so the
@@ -272,9 +331,9 @@ export class CoreSearchProvider implements SearchProvider {
       // (sqlite-vec, vec0, snake_case), add ONE quoted-phrase variant to the
       // initial fan-out so engines that honour phrase quotes surface exact-match
       // pages they'd otherwise drop by stripping the hyphen. The variant is
-      // dispatched CONCURRENTLY in the same Promise.all (not a serial second
-      // sweep), so it adds engine load but no extra wall-clock latency. Bounded
-      // to one extra concurrent dispatch; `queries` stays the user-supplied list
+      // dispatched through the same bounded worker queue (not a serial second
+      // sweep), so it adds one queued variant without bypassing concurrency.
+      // `queries` stays the user-supplied list
       // (the low-recall block below still keys its single-query gate off it).
       // Error-intent bare-token variant: when a single query carries an atomic
       // error token (ERR_MODULE_NOT_FOUND, error[E0499], ...), engines that
@@ -369,6 +428,17 @@ export class CoreSearchProvider implements SearchProvider {
         log.debug('rare-term variant firing', { original: queries[0], variant: rareVariant });
       }
 
+      // Apply the process configuration cap only after all automatic variants
+      // have been considered. This bounds user arrays and rewrite-generated
+      // sweeps with one auditable limit.
+      const cappedDispatchQueries = dispatchQueries.slice(0, maxQueryVariants);
+      if (cappedDispatchQueries.length < dispatchQueries.length) {
+        log.warn('search query variants exceed configured maximum; truncating', {
+          provided: dispatchQueries.length,
+          max: maxQueryVariants,
+        });
+      }
+
       // Recall backfill: the orchestrator slices to the
       // maxResults it is handed, so the downstream score-floor + stale
       // demotion would have NOTHING to backfill from when they drop junk —
@@ -380,8 +450,11 @@ export class CoreSearchProvider implements SearchProvider {
       // already over-fetches relative to a typical floor, so we leave it.
       const dispatchMaxResults = bufferedMaxResults(input.max_results);
 
-      const dispatches = await Promise.all(
-        dispatchQueries.map((q) =>
+      const dispatches = await mapBounded(
+        cappedDispatchQueries,
+        queryConcurrency,
+        ctx.signal,
+        (q, _index, dispatchSignal) =>
           runV1Search({
             query: q,
             category,
@@ -395,27 +468,28 @@ export class CoreSearchProvider implements SearchProvider {
             country: input.country,
             timeRange: input.time_range,
             exactMatch: input.exact_match,
+            signal: dispatchSignal,
+            recoveryBudget,
           }),
-        ),
       );
 
-      if (rareVariant && dispatchQueries.includes(rareVariant)) {
+      if (rareVariant && cappedDispatchQueries.includes(rareVariant)) {
         autoRewrites.push(rareVariant);
       }
       if (
         errorTokenVariant &&
-        dispatchQueries.some((q) => q.trim().toLowerCase() === errorTokenVariant.trim().toLowerCase())
+        cappedDispatchQueries.some((q) => q.trim().toLowerCase() === errorTokenVariant.trim().toLowerCase())
       ) {
         autoRewrites.push(errorTokenVariant);
       }
-      if (entityVariant && dispatchQueries.includes(entityVariant)) {
+      if (entityVariant && cappedDispatchQueries.includes(entityVariant)) {
         autoRewrites.push(entityVariant);
       }
-      if (collisionVariant && dispatchQueries.includes(collisionVariant)) {
+      if (collisionVariant && cappedDispatchQueries.includes(collisionVariant)) {
         autoRewrites.push(collisionVariant);
       }
       queriesExecuted.length = 0;
-      queriesExecuted.push(...dispatchQueries);
+      queriesExecuted.push(...cappedDispatchQueries);
 
       let fused =
         dispatches.length === 1
@@ -432,7 +506,7 @@ export class CoreSearchProvider implements SearchProvider {
         queries.length === 1 &&
         fused.length <= LOW_RECALL_THRESHOLD
       ) {
-        const rewrite = expandQuery(queries[0]);
+        const rewrite = queriesExecuted.length < maxQueryVariants ? expandQuery(queries[0]) : null;
         if (rewrite && rewrite.trim() !== queries[0].trim()) {
           log.debug('low-recall expansion firing', {
             original: queries[0],
@@ -452,6 +526,8 @@ export class CoreSearchProvider implements SearchProvider {
             country: input.country,
             timeRange: input.time_range,
             exactMatch: input.exact_match,
+            signal: ctx.signal,
+            recoveryBudget,
           });
           // RRF-merge the retry results on top of the initial dispatch so
           // we keep ranking signal from both passes.
@@ -487,6 +563,7 @@ export class CoreSearchProvider implements SearchProvider {
               result_count: o.results.length,
               ...(o.error ? { error: o.error } : {}),
               ...(o.skipped ? { skipped: true } : {}),
+              ...(o.reason ? { reason: o.reason } : {}),
             });
           }
         }
@@ -508,13 +585,16 @@ export class CoreSearchProvider implements SearchProvider {
             (acc, r) => (fusedUrlSet.has(r.url) ? acc + 1 : acc),
             0,
           );
+          const reason = o.reason ?? (o.skipped ? 'breaker_open' as const : undefined);
           if (existing) {
             existing.latency_ms += o.latencyMs;
             existing.result_count += o.results.length;
             existing.dedup_kept += kept;
             if (outcome !== 'ok' && existing.outcome === 'ok') existing.outcome = outcome;
             if (o.error && !existing.error) existing.error = o.error;
-            if (o.skipped && !existing.reason) existing.reason = 'breaker_open';
+            if (reason && (!existing.reason || existing.reason === 'recovery_probe')) {
+              existing.reason = reason;
+            }
             if (o.cooldownRemainingMs !== undefined && existing.cooldown_remaining_ms === undefined) {
               existing.cooldown_remaining_ms = o.cooldownRemainingMs;
             }
@@ -526,7 +606,7 @@ export class CoreSearchProvider implements SearchProvider {
               outcome,
               dedup_kept: kept,
               ...(o.error ? { error: o.error } : {}),
-              ...(o.skipped ? { reason: 'breaker_open' as const } : {}),
+              ...(reason ? { reason } : {}),
               ...(o.cooldownRemainingMs !== undefined
                 ? { cooldown_remaining_ms: o.cooldownRemainingMs }
                 : {}),
@@ -720,7 +800,7 @@ export class CoreSearchProvider implements SearchProvider {
         // idempotent; latency-only. Awaited so the launch overlaps setup rather
         // than the per-fetch critical path.
         if (config.searchPrewarmBrowser && typeof ctx.router.prewarmBrowser === 'function') {
-          await ctx.router.prewarmBrowser();
+          await ctx.router.prewarmBrowser(ctx.signal);
         }
         // Candidate set the fetcher will hydrate: min(maxFetches, items). A
         // NARROW set grants each URL a proportionally larger per-URL budget.
@@ -750,6 +830,7 @@ export class CoreSearchProvider implements SearchProvider {
           narrowSetBudgetMs: config.searchNarrowSetBudgetMs || undefined,
           snippetFallback: true,
           ...(renderNarrowSet && { renderNarrowSet }),
+          signal: ctx.signal,
         });
         fetchElapsed = Date.now() - fetchStart;
         contentFetched = true;

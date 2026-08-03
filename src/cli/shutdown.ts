@@ -1,6 +1,7 @@
 import { closeDatabase } from '../cache/db.js';
 import { resetEmbeddingService } from '../embedding/embed.js';
 import { disposeRerankProvider } from '../providers/rerank-provider.js';
+import { disposeEmbedProvider } from '../providers/embed-provider.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('cli');
@@ -20,6 +21,7 @@ export async function shutdownCli(): Promise<void> {
   }
   try {
     resetEmbeddingService();
+    await disposeEmbedProvider();
   } catch (err) {
     log.debug('embedding reset failed', { error: err instanceof Error ? err.message : String(err) });
   }

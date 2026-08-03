@@ -4,6 +4,7 @@ import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { FlagEmbedding } from 'fastembed';
 import {
   FastembedEmbedProvider,
   ensureFastembedCacheDir,
@@ -17,6 +18,83 @@ describe('FastembedEmbedProvider (static)', () => {
     const p = new FastembedEmbedProvider();
     expect(p.modelId).toMatch(/bge.?small/i);
     expect(p.dim).toBe(384);
+  });
+});
+
+describe('FastembedEmbedProvider idle lifecycle', () => {
+  it('releases the ONNX session after the configured idle period and reloads on demand', async () => {
+    vi.useFakeTimers();
+    const release = vi.fn(async () => undefined);
+    const loadModel = vi.fn(async () => ({
+      session: { release },
+      async *embed(texts: string[]) {
+        yield texts.map(() => [0.1, 0.2, 0.3]);
+      },
+    }) as unknown as FlagEmbedding);
+    const provider = new FastembedEmbedProvider({ idleTimeoutMs: 25, loadModel });
+
+    try {
+      await provider.embed(['first']);
+      expect(provider.getRuntimeState()).toMatchObject({
+        state: 'ready',
+        loaded: true,
+        in_flight: 0,
+        idle_timeout_ms: 25,
+      });
+
+      await vi.advanceTimersByTimeAsync(24);
+      expect(release).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(provider.getRuntimeState()).toMatchObject({
+        state: 'unloaded',
+        loaded: false,
+        unload_count: 1,
+      });
+
+      await provider.embed(['second']);
+      expect(loadModel).toHaveBeenCalledTimes(2);
+    } finally {
+      await provider.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not unload while an embedding operation is still active', async () => {
+    vi.useFakeTimers();
+    let finish!: () => void;
+    const inferenceGate = new Promise<void>((resolve) => { finish = resolve; });
+    const release = vi.fn(async () => undefined);
+    const model = {
+      session: { release },
+      async *embed() {
+        await inferenceGate;
+        yield [[0.1, 0.2, 0.3]];
+      },
+    } as unknown as FlagEmbedding;
+    const provider = new FastembedEmbedProvider({
+      idleTimeoutMs: 10,
+      loadModel: async () => model,
+    });
+
+    try {
+      const pending = provider.embed(['busy']);
+      await vi.waitFor(() => {
+        expect(provider.getRuntimeState().in_flight).toBe(1);
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(release).not.toHaveBeenCalled();
+
+      finish();
+      await pending;
+      await vi.advanceTimersByTimeAsync(10);
+      expect(release).toHaveBeenCalledTimes(1);
+    } finally {
+      finish();
+      await provider.dispose();
+      vi.useRealTimers();
+    }
   });
 });
 

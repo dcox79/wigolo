@@ -425,7 +425,7 @@ describe('adaptive in-call retry', () => {
     expect(waits).toEqual([100]);
   });
 
-  it('rotates to a different user agent on a 403/blocked retry via the engine onRetry hook', async () => {
+  it('rotates once on a 403/blocked retry via the engine onRetry hook', async () => {
     // WHY: IP/UA-reputation 403s often clear on a fresh fingerprint. The
     // retry loop is engine-agnostic, so it drives an optional onRetry hook;
     // an HTML-scraping engine rotates its UA there. Assert > 1 distinct UA
@@ -456,7 +456,10 @@ describe('adaptive in-call retry', () => {
     await vi.runAllTimersAsync();
     await p;
 
-    expect(observedUas.length).toBe(3);
+    // A fingerprint escalation is allowed at most once. Repeating it after a
+    // second 403 only adds load against an upstream that has rejected both
+    // identities.
+    expect(observedUas.length).toBe(2);
     const distinct = new Set(observedUas);
     expect(distinct.size).toBeGreaterThan(1);
     expect(observedUas[1]).not.toBe(observedUas[0]);

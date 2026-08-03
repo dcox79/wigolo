@@ -1,5 +1,7 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -32,7 +34,6 @@ export class MarginaliaEngine implements SearchEngine {
   name = 'marginalia';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const params = new URLSearchParams({ query, count: String(maxResults), dc: '3' });
@@ -40,18 +41,20 @@ export class MarginaliaEngine implements SearchEngine {
 
     log.debug('querying marginalia', { query });
 
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        'User-Agent': 'wigolo/0.1 (https://github.com/KnockOutEZ/wigolo)',
-        Accept: 'application/json',
-        'API-Key': 'public',
-      },
-    });
-    if (!response.ok) throw new Error(`Marginalia returned ${response.status}`);
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, {
+        signal,
+        headers: {
+          'User-Agent': 'wigolo/0.1 (https://github.com/KnockOutEZ/wigolo)',
+          Accept: 'application/json',
+          'API-Key': 'public',
+        },
+      });
+      assertUpstreamOk(this.name, response);
 
-    const body = (await response.json()) as MarginaliaBody;
-    return this.parseResults(body, maxResults);
+      const body = (await response.json()) as MarginaliaBody;
+      return this.parseResults(body, maxResults);
+    });
   }
 
   parseResults(body: unknown, maxResults: number): RawSearchResult[] {

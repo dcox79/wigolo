@@ -4,7 +4,7 @@ import { getConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import { BrowserSelector, type SelectionStrategy } from './browser-selector.js';
 import { executeActions } from './action-executor.js';
-import { abortRejection } from '../util/abort.js';
+import { abortRejection, anySignal } from '../util/abort.js';
 import { settlePage, toCompleteness } from './settle.js';
 import { DOM_VERDICT_SOURCE, type DomVerdict } from './hydration-probe.js';
 import type { ContentCompleteness } from '../types.js';
@@ -22,6 +22,7 @@ import {
   headersForRedirect,
   type NetworkRequestGuard,
 } from './network-security.js';
+import { acquireGlobalBrowserCapacity } from './browser-capacity.js';
 
 /**
  * Host of a fetched URL, or null on a malformed URL. Used to key the anti-bot
@@ -189,10 +190,18 @@ function getLauncher(type: BrowserType) {
 
 interface TypePool {
   browser: Browser | null;
+  launchPromise: Promise<Browser> | null;
   pool: BrowserContext[];
   activeCount: number;
-  waitQueue: Array<(ctx: BrowserContext) => void>;
+  waitQueue: TypeWaiter[];
   idleTimers: Map<BrowserContext, ReturnType<typeof setTimeout>>;
+}
+
+interface TypeWaiter {
+  resolve: (ctx: BrowserContext) => void;
+  reject: (reason?: unknown) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
 }
 
 export class MultiBrowserPool {
@@ -200,14 +209,7 @@ export class MultiBrowserPool {
   private readonly selector: BrowserSelector;
   private readonly configuredTypes: BrowserType[];
   private shutdownCalled = false;
-  // Bounded semaphore for the DEDICATED stealth path. That path launches its
-  // own throwaway browser + context, bypassing the pooled activeCount/maxBrowsers
-  // accounting — so without this a burst of stealth fetches could spawn one
-  // browser per fetch and blow past the cap. Mirrors the acquire/release
-  // activeCount + waitQueue pattern: a stealth fetch acquires a slot before
-  // launching and releases it after close.
-  private stealthActive = 0;
-  private readonly stealthWaitQueue: Array<() => void> = [];
+  protected readonly shutdownController = new AbortController();
 
   constructor(options?: MultiBrowserPoolOptions) {
     let types = options?.browserTypes ?? ['chromium'];
@@ -221,6 +223,7 @@ export class MultiBrowserPool {
     for (const type of types) {
       this.pools.set(type, {
         browser: null,
+        launchPromise: null,
         pool: [],
         activeCount: 0,
         waitQueue: [],
@@ -274,18 +277,35 @@ export class MultiBrowserPool {
 
   private async launchBrowser(type: BrowserType): Promise<Browser> {
     const typePool = this.pools.get(type)!;
-    if (!typePool.browser) {
+    if (typePool.browser) return typePool.browser;
+    if (typePool.launchPromise) return typePool.launchPromise;
+
+    const launchPromise = (async () => {
       const launcher = getLauncher(type);
       const cfg = getConfig();
       const proxy = playwrightProxyOption(cfg.proxyUrl, cfg.useProxy);
       log.debug('launching browser', { type, proxied: proxy !== undefined });
-      typePool.browser = await launcher.launch({
+      const browser = await launcher.launch({
         headless: true,
         env: sanitizedChildEnv({ stripProxy: true }),
         ...(proxy ? { proxy } : {}),
       });
+      if (this.shutdownCalled) {
+        await browser.close().catch(() => {});
+        throw new DOMException('browser pool shut down during launch', 'AbortError');
+      }
+      typePool.browser = browser;
+      return browser;
+    })();
+    typePool.launchPromise = launchPromise;
+
+    try {
+      return await launchPromise;
+    } finally {
+      if (typePool.launchPromise === launchPromise) {
+        typePool.launchPromise = null;
+      }
     }
-    return typePool.browser;
   }
 
   /**
@@ -296,22 +316,32 @@ export class MultiBrowserPool {
    * Latency-only; does not touch the context pool, so it never disturbs
    * in-flight fetches, downloads, or the idle-eviction bookkeeping.
    */
-  async warm(): Promise<void> {
+  async warm(signal?: AbortSignal): Promise<void> {
     if (this.shutdownCalled) return;
     const type = this.configuredTypes[0];
     const typePool = this.pools.get(type);
     if (!typePool || typePool.browser) return; // already warm
+    let releaseCapacity: (() => void) | undefined;
+    const combined = signal
+      ? anySignal([signal, this.shutdownController.signal])
+      : undefined;
+    const warmSignal = combined?.signal ?? this.shutdownController.signal;
     try {
+      releaseCapacity = await acquireGlobalBrowserCapacity(warmSignal);
       await this.launchBrowser(type);
     } catch (err) {
       log.debug('browser prewarm skipped', {
         type,
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      releaseCapacity?.();
+      combined?.cleanup();
     }
   }
 
-  protected async acquireForType(type: BrowserType): Promise<BrowserContext> {
+  protected async acquireForType(type: BrowserType, signal?: AbortSignal): Promise<BrowserContext> {
+    if (signal?.aborted) throw signal.reason;
     const config = getConfig();
     const maxBrowsers = config.maxBrowsers;
     const typePool = this.pools.get(type)!;
@@ -328,15 +358,36 @@ export class MultiBrowserPool {
 
     if (typePool.activeCount < maxBrowsers) {
       typePool.activeCount++;
-      const browser = await this.launchBrowser(type);
-      // acceptDownloads lets a PDF (or other binary) response be captured as a
-      // download rather than triggering an unhandled navigation error. Harmless
-      // for normal navigations — no download event fires.
-      return browser.newContext({ acceptDownloads: true });
+      try {
+        const browser = await this.launchBrowser(type);
+        // acceptDownloads lets a PDF (or other binary) response be captured as a
+        // download rather than triggering an unhandled navigation error. Harmless
+        // for normal navigations — no download event fires.
+        const ctx = await browser.newContext({ acceptDownloads: true });
+        if (signal?.aborted) {
+          await ctx.close().catch(() => {});
+          throw signal.reason;
+        }
+        return ctx;
+      } catch (err) {
+        // activeCount tracks successfully-created contexts. A launch or
+        // newContext failure must not permanently consume a local pool slot.
+        typePool.activeCount = Math.max(0, typePool.activeCount - 1);
+        throw err;
+      }
     }
 
-    return new Promise<BrowserContext>((resolve) => {
-      typePool.waitQueue.push(resolve);
+    return new Promise<BrowserContext>((resolve, reject) => {
+      const waiter: TypeWaiter = { resolve, reject, signal };
+      if (signal) {
+        waiter.onAbort = () => {
+          const index = typePool.waitQueue.indexOf(waiter);
+          if (index !== -1) typePool.waitQueue.splice(index, 1);
+          reject(signal.reason);
+        };
+        signal.addEventListener('abort', waiter.onAbort, { once: true });
+      }
+      typePool.waitQueue.push(waiter);
     });
   }
 
@@ -345,9 +396,22 @@ export class MultiBrowserPool {
     const idleTimeoutMs = config.browserIdleTimeoutMs;
     const typePool = this.pools.get(type)!;
 
-    if (typePool.waitQueue.length > 0) {
-      const resolve = typePool.waitQueue.shift()!;
-      resolve(ctx);
+    while (typePool.waitQueue.length > 0) {
+      const waiter = typePool.waitQueue.shift()!;
+      if (waiter.onAbort && waiter.signal) {
+        waiter.signal.removeEventListener('abort', waiter.onAbort);
+      }
+      if (waiter.signal?.aborted) {
+        waiter.reject(waiter.signal.reason);
+        continue;
+      }
+      waiter.resolve(ctx);
+      return;
+    }
+
+    if (this.shutdownCalled) {
+      typePool.activeCount = Math.max(0, typePool.activeCount - 1);
+      ctx.close().catch(() => {});
       return;
     }
 
@@ -366,34 +430,42 @@ export class MultiBrowserPool {
     typePool.idleTimers.set(ctx, timer);
   }
 
-  // Acquire a dedicated-stealth concurrency slot. Resolves immediately when a
-  // slot is free, otherwise queues until a release frees one. Default limit is
-  // config.maxBrowsers so the hardened path shares the same overall cap as the
-  // pooled path.
-  private acquireStealthSlot(): Promise<void> {
-    const limit = getConfig().maxBrowsers;
-    if (this.stealthActive < limit) {
-      this.stealthActive++;
-      return Promise.resolve();
+  /** Close a context that failed during request setup instead of recycling it. */
+  private async discardForType(type: BrowserType, ctx: BrowserContext): Promise<void> {
+    const typePool = this.pools.get(type)!;
+    const timer = typePool.idleTimers.get(ctx);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      typePool.idleTimers.delete(ctx);
     }
-    return new Promise<void>((resolve) => {
-      this.stealthWaitQueue.push(resolve);
-    });
-  }
-
-  // Release a dedicated-stealth slot. Hands the slot straight to the next
-  // waiter when one is queued (keeping stealthActive at the cap), otherwise
-  // decrements the active count.
-  private releaseStealthSlot(): void {
-    const next = this.stealthWaitQueue.shift();
-    if (next) {
-      next();
-      return;
-    }
-    this.stealthActive = Math.max(0, this.stealthActive - 1);
+    const pooledIndex = typePool.pool.indexOf(ctx);
+    if (pooledIndex !== -1) typePool.pool.splice(pooledIndex, 1);
+    typePool.activeCount = Math.max(0, typePool.activeCount - 1);
+    await ctx.close().catch(() => {});
   }
 
   async fetchWithBrowser(url: string, options: BrowserFetchOptions = {}): Promise<RawFetchResult> {
+    const signals = options.signal
+      ? [options.signal, this.shutdownController.signal]
+      : [this.shutdownController.signal];
+    const combined = anySignal(signals);
+    let releaseCapacity: (() => void) | undefined;
+    try {
+      releaseCapacity = await acquireGlobalBrowserCapacity(combined.signal);
+      return await this.fetchWithBrowserAtCapacity(url, {
+        ...options,
+        signal: combined.signal,
+      });
+    } finally {
+      releaseCapacity?.();
+      combined.cleanup();
+    }
+  }
+
+  private async fetchWithBrowserAtCapacity(
+    url: string,
+    options: BrowserFetchOptions,
+  ): Promise<RawFetchResult> {
     // Bail out immediately if the caller's budget is already exhausted.
     if (options.signal?.aborted) throw options.signal.reason;
 
@@ -409,7 +481,6 @@ export class MultiBrowserPool {
     // must close both at end-of-fetch instead of releasing to the shared pool.
     let dedicated = false;
     let dedicatedBrowser: Browser | null = null;
-    let stealthSlotHeld = false;
     // The UA this context authoritatively advertises — recorded alongside a
     // minted clearance so a later reuse can UA-match the consuming tier. Known
     // on the stealth path (resolveStealthUA); the pooled/CDP default is read
@@ -429,17 +500,16 @@ export class MultiBrowserPool {
         const contexts = cdpBrowser.contexts();
         ctx = contexts.length > 0 ? contexts[0] : await cdpBrowser.newContext();
       } catch (err) {
+        await cdpBrowser?.close().catch(() => {});
+        cdpBrowser = null;
         log.warn('CDP connection failed, falling back to launch', {
           cdpUrl: redactUrl(options.cdpUrl),
           error: err instanceof Error ? err.message : String(err),
         });
-        ctx = await this.acquireForType(resolvedType);
+        ctx = await this.acquireForType(resolvedType, options.signal);
       }
     } else if (useStealth) {
       resolvedType = this.resolveType(options.browserType, url);
-      // Bound concurrency BEFORE launching so a burst cannot exceed the cap.
-      await this.acquireStealthSlot();
-      stealthSlotHeld = true;
       dedicated = true;
       log.debug('fetching with browser (anti-bot fingerprint hardening)', { url, type: resolvedType });
       // Launch a SEPARATE throwaway browser with the hardening launch args so
@@ -447,12 +517,9 @@ export class MultiBrowserPool {
       // its default launch). The dedicated context + browser are closed in the
       // finally.
       //
-      // This setup runs OUTSIDE the main try/finally below, so any throw here
-      // (launch/newContext/addInitScript/newPage — e.g. browser not installed,
-      // resource exhaustion, launch race) would otherwise leak the semaphore
-      // slot AND orphan a launched browser. Clean up locally + rethrow. On the
-      // success path the catch never runs, so the finally below stays the sole
-      // releaser — no double-release.
+      // This setup runs outside the page-level try/finally below. Close an
+      // orphaned throwaway browser locally on failure; the outer global
+      // capacity lease is released by fetchWithBrowser regardless.
       try {
         const launcher = getLauncher(resolvedType);
         const cfgProxy = getConfig();
@@ -470,22 +537,15 @@ export class MultiBrowserPool {
           await ctx.addInitScript(STEALTH_INIT_SCRIPT);
         }
       } catch (err) {
-        // Close the orphaned throwaway browser (if launch got that far) and
-        // free the concurrency slot before rethrowing — otherwise N such
-        // failures would exhaust the semaphore and hang all later stealth
-        // fetches.
+        // Close the orphaned throwaway browser if launch got that far.
         await dedicatedBrowser?.close().catch(() => {});
         dedicatedBrowser = null;
-        if (stealthSlotHeld) {
-          this.releaseStealthSlot();
-          stealthSlotHeld = false;
-        }
         throw err;
       }
     } else {
       resolvedType = this.resolveType(options.browserType, url);
       log.debug('fetching with browser', { url, type: resolvedType });
-      ctx = await this.acquireForType(resolvedType);
+      ctx = await this.acquireForType(resolvedType, options.signal);
     }
 
     // Seed reused anti-bot clearance cookies BEFORE navigation so a solved
@@ -506,19 +566,18 @@ export class MultiBrowserPool {
     try {
       page = await ctx.newPage();
     } catch (err) {
-      // newPage runs before the main try/finally. On the dedicated stealth path
-      // a throw here would leak the semaphore slot + orphan the throwaway
-      // browser exactly like the setup above; clean those up and rethrow. The
-      // pooled/CDP paths keep their prior behavior (the context is not
-      // dedicated, so only the rethrow applies).
-      if (dedicated) {
+      // newPage runs before the main page try/finally. Release/close whichever
+      // context path acquired it so a setup failure cannot strand local or
+      // global capacity.
+      if (cdpBrowser) {
+        await cdpBrowser.close().catch(() => {});
+        cdpBrowser = null;
+      } else if (dedicated) {
         await ctx.close().catch(() => {});
         await dedicatedBrowser?.close().catch(() => {});
         dedicatedBrowser = null;
-        if (stealthSlotHeld) {
-          this.releaseStealthSlot();
-          stealthSlotHeld = false;
-        }
+      } else {
+        await this.discardForType(resolvedType, ctx);
       }
       throw err;
     }
@@ -529,63 +588,63 @@ export class MultiBrowserPool {
     const onAbort = () => { page.close().catch(() => {}); };
     options.signal?.addEventListener('abort', onAbort, { once: true });
 
-    // Capture a download so a PDF (or other binary) response served to the
-    // browser is turned into a buffered result instead of a hard nav error.
-    // Registered before goto so the event is never missed. Guarded so page
-    // stubs without `on` (unit-test mocks) are unaffected.
-    let capturedDownload: Download | undefined;
-    if (typeof page.on === 'function') {
-      page.on('download', (dl) => { capturedDownload = dl; });
-    }
-
-    // A page-level route is the browser tier's last gate before Chromium opens
-    // a connection. It protects redirects AND subresources (a public document
-    // can otherwise embed an internal URL), and injects caller headers only
-    // under the origin policy below. Avoid setExtraHTTPHeaders here: Playwright
-    // applies those headers to every origin, including cross-origin redirects.
-    let blockedNavigationError: unknown;
-    const pageWithRoute = page as typeof page & {
-      route?: typeof page.route;
-    };
-    if (typeof pageWithRoute.route === 'function' && (options.requestGuard || options.headers)) {
-      await pageWithRoute.route('**/*', async (route) => {
-        const request = route.request();
-        const requestUrl = request.url();
-        try {
-          await options.requestGuard?.(requestUrl, 'browser request');
-        } catch (err) {
-          if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
-            blockedNavigationError = err;
-          }
-          await route.abort('blockedbyclient').catch(() => {});
-          return;
-        }
-
-        const callerHeaders = headersForRedirect(options.headers, url, requestUrl);
-        const requestHeaders = request.headers();
-        await route.continue({
-          headers: callerHeaders ? { ...requestHeaders, ...callerHeaders } : requestHeaders,
-        });
-      });
-    } else if (options.headers) {
-      // Unit-test page stubs may not implement route(). Production Playwright
-      // pages always do; retain the old fallback solely for those stubs.
-      await page.setExtraHTTPHeaders(options.headers);
-    }
-
-    let statusCode = 200;
-    let contentType = '';
-    let responseHeaders: Record<string, string> = {};
-    let finalUrl = url;
-    let gotoTimedOut = false;
-    // True once a fetch entered the challenge-completion poll. A poll that clears
-    // to a near-empty stub (DataDome swaps its interstitial for a tiny `g2.com`
-    // body carrying no marker) must NOT be served as content — after full
-    // hydration below, a still-empty body means the wall never really let us
-    // through, so it's a labeled block, not a pass.
-    let enteredChallengePoll = false;
-
     try {
+      // Capture a download so a PDF (or other binary) response served to the
+      // browser is turned into a buffered result instead of a hard nav error.
+      // Registered before goto so the event is never missed. Guarded so page
+      // stubs without `on` (unit-test mocks) are unaffected.
+      let capturedDownload: Download | undefined;
+      if (typeof page.on === 'function') {
+        page.on('download', (dl) => { capturedDownload = dl; });
+      }
+
+      // A page-level route is the browser tier's last gate before Chromium opens
+      // a connection. It protects redirects AND subresources (a public document
+      // can otherwise embed an internal URL), and injects caller headers only
+      // under the origin policy below. Avoid setExtraHTTPHeaders here: Playwright
+      // applies those headers to every origin, including cross-origin redirects.
+      let blockedNavigationError: unknown;
+      const pageWithRoute = page as typeof page & {
+        route?: typeof page.route;
+      };
+      if (typeof pageWithRoute.route === 'function' && (options.requestGuard || options.headers)) {
+        await pageWithRoute.route('**/*', async (route) => {
+          const request = route.request();
+          const requestUrl = request.url();
+          try {
+            await options.requestGuard?.(requestUrl, 'browser request');
+          } catch (err) {
+            if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+              blockedNavigationError = err;
+            }
+            await route.abort('blockedbyclient').catch(() => {});
+            return;
+          }
+
+          const callerHeaders = headersForRedirect(options.headers, url, requestUrl);
+          const requestHeaders = request.headers();
+          await route.continue({
+            headers: callerHeaders ? { ...requestHeaders, ...callerHeaders } : requestHeaders,
+          });
+        });
+      } else if (options.headers) {
+        // Unit-test page stubs may not implement route(). Production Playwright
+        // pages always do; retain the old fallback solely for those stubs.
+        await page.setExtraHTTPHeaders(options.headers);
+      }
+
+      let statusCode = 200;
+      let contentType = '';
+      let responseHeaders: Record<string, string> = {};
+      let finalUrl = url;
+      let gotoTimedOut = false;
+      // True once a fetch entered the challenge-completion poll. A poll that clears
+      // to a near-empty stub (DataDome swaps its interstitial for a tiny `g2.com`
+      // body carrying no marker) must NOT be served as content — after full
+      // hydration below, a still-empty body means the wall never really let us
+      // through, so it's a labeled block, not a pass.
+      let enteredChallengePoll = false;
+
       // Pre-navigation fetch-time SSRF re-check. `guardFetchUrl` (applied
       // upstream on input + every redirect hop before a fetch reaches the
       // browser tier) only validates the LITERAL host, so a public hostname
@@ -921,14 +980,10 @@ export class MultiBrowserPool {
         await cdpBrowser.close().catch(() => {});
       } else if (dedicated) {
         // Dedicated stealth path: close the per-fetch context + throwaway
-        // browser (NEVER release to the shared pool) — guaranteed on abort too
-        // — then free the concurrency slot for the next waiter.
+        // browser (NEVER release to the shared pool) — guaranteed on abort too.
         await ctx.close().catch(() => {});
         if (dedicatedBrowser) {
           await dedicatedBrowser.close().catch(() => {});
-        }
-        if (stealthSlotHeld) {
-          this.releaseStealthSlot();
         }
       } else {
         // Always release the slot — even on abort — so the pool is not leaked.
@@ -940,8 +995,17 @@ export class MultiBrowserPool {
   async shutdown(): Promise<void> {
     if (this.shutdownCalled) return;
     this.shutdownCalled = true;
+    this.shutdownController.abort(new DOMException('browser pool shut down', 'AbortError'));
 
     for (const [type, typePool] of this.pools) {
+      while (typePool.waitQueue.length > 0) {
+        const waiter = typePool.waitQueue.shift()!;
+        if (waiter.onAbort && waiter.signal) {
+          waiter.signal.removeEventListener('abort', waiter.onAbort);
+        }
+        waiter.reject(this.shutdownController.signal.reason);
+      }
+
       for (const [, timer] of typePool.idleTimers) {
         clearTimeout(timer);
       }
@@ -950,6 +1014,8 @@ export class MultiBrowserPool {
       const closePromises = typePool.pool.map(ctx => ctx.close().catch(() => {}));
       typePool.pool = [];
       await Promise.all(closePromises);
+
+      await typePool.launchPromise?.catch(() => {});
 
       if (typePool.browser) {
         await typePool.browser.close().catch(() => {});
@@ -965,6 +1031,7 @@ export class MultiBrowserPool {
 // Backwards-compatible wrapper for existing code
 export class BrowserPool extends MultiBrowserPool {
   private readonly singleType: BrowserType;
+  private readonly capacityReleases = new Map<BrowserContext, () => void>();
 
   constructor(options?: BrowserPoolOptions) {
     const type = options?.browserType ?? 'chromium';
@@ -974,11 +1041,42 @@ export class BrowserPool extends MultiBrowserPool {
     this.singleType = type;
   }
 
-  async acquire(): Promise<BrowserContext> {
-    return this.acquireForType(this.singleType);
+  async acquire(signal?: AbortSignal): Promise<BrowserContext> {
+    const signals = signal
+      ? [signal, this.shutdownController.signal]
+      : [this.shutdownController.signal];
+    const combined = anySignal(signals);
+    let releaseCapacity: (() => void) | undefined;
+    try {
+      releaseCapacity = await acquireGlobalBrowserCapacity(combined.signal);
+      const ctx = await this.acquireForType(this.singleType, combined.signal);
+      this.capacityReleases.set(ctx, releaseCapacity);
+      releaseCapacity = undefined;
+      return ctx;
+    } finally {
+      releaseCapacity?.();
+      combined.cleanup();
+    }
   }
 
   release(ctx: BrowserContext): void {
     this.releaseForType(this.singleType, ctx);
+    const releaseCapacity = this.capacityReleases.get(ctx);
+    this.capacityReleases.delete(ctx);
+    releaseCapacity?.();
+  }
+
+  override async shutdown(): Promise<void> {
+    try {
+      await super.shutdown();
+    } finally {
+      // Direct acquire() callers may shut the pool down without returning every
+      // checked-out context. The browser close reclaims those contexts; mirror it
+      // by releasing their process-wide leases as well.
+      for (const releaseCapacity of this.capacityReleases.values()) {
+        releaseCapacity();
+      }
+      this.capacityReleases.clear();
+    }
   }
 }

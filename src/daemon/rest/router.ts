@@ -128,11 +128,12 @@ export class RestRouter {
         // held until the work settles.
         const mappedTool = shimTimeoutTool(subPath);
         const deadline = mappedTool ? deadlineFor(mappedTool) : SHIM_SHORT_DEADLINE_MS;
-        await this.runUnderSlotAndDeadline(res, deadline, mappedTool ?? 'compat', async () => {
+        await this.runUnderSlotAndDeadline(req, res, deadline, mappedTool ?? 'compat', async (_releaseSlot, signal) => {
           const { handleCompatRequest } = await import('./firecrawl-compat.js');
           await handleCompatRequest(req, res, {
             subsystems: this.opts.subsystems,
             bindIsLoopback: this.bindIsLoopback,
+            signal,
             subPath,
             respond: (status, body, headers) => this.respond(res, status, body, headers),
           });
@@ -159,6 +160,28 @@ export class RestRouter {
         }
         if (!this.passesAuth(req, res)) return;
         this.respond(res, 200, buildToolsIndex());
+        return;
+      }
+
+      // Read-only live diagnostics. It sits behind the same REST auth gate as
+      // tool discovery and never returns request data, URLs, or credentials.
+      if (pathname === '/v1/diagnostics') {
+        if (method !== 'GET') {
+          this.sendError(res, methodNotAllowed('GET'));
+          return;
+        }
+        if (!this.passesAuth(req, res)) return;
+        const [engine, browser, runtime] = await Promise.all([
+          import('../../search/core/engine-base.js'),
+          import('../../fetch/browser-capacity.js'),
+          import('../runtime-telemetry.js'),
+        ]);
+        this.respond(res, 200, {
+          status: 'ok',
+          ...runtime.getRuntimeTelemetry(),
+          engines: engine.getLiveEngineStateSnapshot(),
+          browser_capacity: browser.getGlobalBrowserCapacityState(),
+        });
         return;
       }
 
@@ -200,10 +223,11 @@ export class RestRouter {
    * identical bounds (D11 — the shim is not an escape hatch).
    */
   private async runUnderSlotAndDeadline(
+    req: IncomingMessage,
     res: ServerResponse,
     deadline: number,
     label: string,
-    work: (releaseSlot: () => void) => Promise<void>,
+    work: (releaseSlot: () => void, signal: AbortSignal) => Promise<void>,
   ): Promise<void> {
     if (!this.slots.tryAcquire()) {
       this.sendError(res, tooManyRequests());
@@ -217,20 +241,46 @@ export class RestRouter {
       }
     };
 
-    const workPromise = work(releaseSlot)
+    const deadlineController = new AbortController();
+    let clientDisconnected = false;
+    const onClientDisconnect = () => {
+      if (clientDisconnected) return;
+      clientDisconnected = true;
+      deadlineController.abort(new DOMException('HTTP client disconnected', 'AbortError'));
+    };
+    const onResponseClose = () => {
+      if (!res.writableEnded) onClientDisconnect();
+    };
+    req.once('aborted', onClientDisconnect);
+    if (typeof res.once === 'function') res.once('close', onResponseClose);
+    if (req.aborted || res.destroyed) onClientDisconnect();
+    const cleanupDisconnectListeners = () => {
+      req.removeListener('aborted', onClientDisconnect);
+      if (typeof res.removeListener === 'function') res.removeListener('close', onResponseClose);
+    };
+
+    const workPromise = work(releaseSlot, deadlineController.signal)
       .then(() => {
         releaseSlot();
       })
       .catch((err) => {
         releaseSlot();
-        log.error('REST request work threw', { tool: label, error: String(err) });
-        this.sendError(res, internalError());
-      });
+        if (clientDisconnected) {
+          log.debug('REST request cancelled after client disconnect', { tool: label });
+        } else {
+          log.error('REST request work threw', { tool: label, error: String(err) });
+          this.sendError(res, internalError());
+        }
+      })
+      .finally(cleanupDisconnectListeners);
 
     let timer: NodeJS.Timeout;
     const timeoutPromise = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
         // Deadline hit: respond 504 but keep the slot until the work settles.
+        const timeoutError = new Error(`REST ${label} deadline exceeded`);
+        timeoutError.name = 'TimeoutError';
+        deadlineController.abort(timeoutError);
         this.sendError(res, routeTimeout(label));
         resolve();
       }, deadline);
@@ -242,7 +292,7 @@ export class RestRouter {
   }
 
   private async handleToolRequest(tool: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
-    await this.runUnderSlotAndDeadline(res, deadlineFor(tool), tool, async (releaseSlot) => {
+    await this.runUnderSlotAndDeadline(req, res, deadlineFor(tool), tool, async (releaseSlot, signal) => {
       // Body cap read.
       let body: unknown;
       try {
@@ -282,7 +332,11 @@ export class RestRouter {
       }
 
       // Dispatch — the slot is released when this settles (see helper).
-      const ctx: DispatchContext = { subsystems: this.opts.subsystems, bindIsLoopback: this.bindIsLoopback };
+      const ctx: DispatchContext = {
+        subsystems: this.opts.subsystems,
+        bindIsLoopback: this.bindIsLoopback,
+        signal,
+      };
       const result = await dispatchTool(tool, body, ctx);
       this.respond(res, result.status, result.body, result.headers ?? {});
     });

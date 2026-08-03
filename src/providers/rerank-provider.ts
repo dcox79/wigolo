@@ -7,6 +7,8 @@
  * but it is no longer wired in.
  */
 import { createLogger } from '../logger.js';
+import { getConfig } from '../config.js';
+import type { ModelRuntimeSnapshot } from './model-runtime.js';
 
 const log = createLogger('providers');
 export interface RerankCandidate {
@@ -27,9 +29,15 @@ export interface RerankProvider {
   ): Promise<RerankResult[]>;
   /** Model identifier (for cache invalidation / provenance). */
   readonly modelId: string;
+  /** Optional native-resource lifecycle hooks implemented by built-ins. */
+  dispose?(): Promise<void>;
+  getRuntimeState?(): ModelRuntimeSnapshot;
 }
 
 let cached: Promise<RerankProvider> | null = null;
+let current: RerankProvider | null = null;
+let loading = false;
+let lastError: string | null = null;
 
 /**
  * True when an error looks like a transient network/fetch blip a retry can
@@ -77,10 +85,14 @@ export async function withFetchRetry<T>(
 
 export function getRerankProvider(): Promise<RerankProvider> {
   if (cached) return cached;
+  loading = true;
+  lastError = null;
   cached = import('../search/reranker/transformers-rerank-provider.js')
     .then(async (m) => {
       const p = new m.TransformersRerankProvider();
+      current = p;
       await withFetchRetry(() => p.warmup());
+      loading = false;
       log.info('rerank provider ready', {
         provider: 'rerank',
         impl: 'transformers',
@@ -90,13 +102,20 @@ export function getRerankProvider(): Promise<RerankProvider> {
     })
     .catch((err) => {
       cached = null;
+      current = null;
+      loading = false;
+      lastError = err instanceof Error ? err.message : String(err);
       throw err;
     });
   return cached;
 }
 
 export function _resetRerankProviderForTest(): void {
+  if (current && typeof current.dispose === 'function') void current.dispose();
   cached = null;
+  current = null;
+  loading = false;
+  lastError = null;
 }
 
 // Best-effort disposal of the cached rerank provider's native resources.
@@ -111,5 +130,29 @@ export async function disposeRerankProvider(): Promise<void> {
     log.debug('rerank dispose failed', { error: err instanceof Error ? err.message : String(err) });
   } finally {
     cached = null;
+    current = null;
+    loading = false;
   }
+}
+
+export function getRerankProviderState(): ModelRuntimeSnapshot {
+  if (current && typeof current.getRuntimeState === 'function') {
+    return current.getRuntimeState();
+  }
+  const configTimeout = getConfig().rerankerIdleTimeoutMs;
+  return {
+    state: loading ? 'loading' : lastError ? 'error' : 'unloaded',
+    loaded: false,
+    model_id: getConfig().rerankerModel,
+    in_flight: 0,
+    idle_timeout_ms: Number.isFinite(configTimeout) ? configTimeout : 300_000,
+    last_used_at: null,
+    unload_due_at: null,
+    last_loaded_at: null,
+    last_unloaded_at: null,
+    load_count: 0,
+    unload_count: 0,
+    dispose_supported: true,
+    last_error: lastError,
+  };
 }

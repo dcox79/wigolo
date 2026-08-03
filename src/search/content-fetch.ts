@@ -55,6 +55,9 @@ export interface FetchContentContext {
    *  stays bounded to a few URLs. Absent ⇒ legacy auto path for every URL
    *  (broad searches never pay the browser cold-start). */
   renderNarrowSet?: { maxCandidates: number };
+  /** Top-level MCP/REST cancellation. Combined with the stage and per-URL
+   * deadlines so enrichment cannot outlive its search request. */
+  signal?: AbortSignal;
 }
 
 interface SingleFetch {
@@ -243,6 +246,10 @@ export async function fetchContentForResults(
   // the totalDeadline fires. When stageBudgetMs is absent the stageDeadline
   // equals totalDeadline and no extra timer fires — legacy path is preserved.
   const stageController = new AbortController();
+  const combinedStage = ctx.signal
+    ? anySignal([ctx.signal, stageController.signal])
+    : undefined;
+  const stageSignal = combinedStage?.signal ?? stageController.signal;
   const stageDeadline =
     ctx.stageBudgetMs !== undefined
       ? Math.min(ctx.totalDeadline, Date.now() + ctx.stageBudgetMs)
@@ -260,8 +267,11 @@ export async function fetchContentForResults(
 
   try {
     const fetched = await Promise.all(
-      fetchTargets.map((r) => fetchOne(r.url, router, ctx, stageController.signal)),
+      fetchTargets.map((r) => fetchOne(r.url, router, ctx, stageSignal)),
     );
+    if (ctx.signal?.aborted) {
+      throw ctx.signal.reason ?? new DOMException('search aborted', 'AbortError');
+    }
 
     // Track which backup URL (if any) filled each failed slot. The backup's
     // content lands in the backup's own SearchResultItem (preserving the
@@ -280,6 +290,7 @@ export async function fetchContentForResults(
       let nextBackupIdx = cap;
       while (
         Date.now() < stageDeadline &&
+        !stageSignal.aborted &&
         nextBackupIdx < results.length &&
         backupsAccepted < originalFailedCount
       ) {
@@ -298,8 +309,11 @@ export async function fetchContentForResults(
         if (wave.length === 0) break;
 
         const waveResults = await Promise.all(
-          wave.map((r) => fetchOne(r.url, router, ctx, stageController.signal)),
+          wave.map((r) => fetchOne(r.url, router, ctx, stageSignal)),
         );
+        if (ctx.signal?.aborted) {
+          throw ctx.signal.reason ?? new DOMException('search aborted', 'AbortError');
+        }
 
         // Promote successful backups into fetchTargets / fetched. The order
         // of insertion mirrors the wave order, which keeps the relevance-
@@ -352,5 +366,6 @@ export async function fetchContentForResults(
   } finally {
     if (stageTimer !== undefined) clearTimeout(stageTimer);
     stageController.abort(); // cancel any stragglers
+    combinedStage?.cleanup();
   }
 }

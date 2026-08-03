@@ -1,4 +1,7 @@
-import type { EmbedProvider } from '../providers/embed-provider.js';
+import {
+  getEmbedProvider,
+  type EmbedProvider,
+} from '../providers/embed-provider.js';
 import {
   getVectorStore,
   type VectorStore,
@@ -9,7 +12,6 @@ import {
   getAllEmbeddings,
   normalizeUrl,
 } from '../cache/store.js';
-import { FastembedEmbedProvider } from './fastembed-provider.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('embedding');
@@ -48,9 +50,11 @@ export interface IndexView {
  */
 const RETRY_MEMO_MS = 60_000;
 const MAX_LOAD_ATTEMPTS = 3;
+const DEFAULT_EMBED_PROVIDER_MODEL_ID = 'BGE-small-en-v1.5';
 
 export class EmbeddingService {
-  private provider: EmbedProvider;
+  private provider: EmbedProvider | null;
+  private readonly resolveProvider: () => Promise<EmbedProvider>;
   private store: VectorStore | null = null;
   private knownUrls = new Set<string>();
   private available = false;
@@ -63,7 +67,14 @@ export class EmbeddingService {
   private latchedOff = false;
 
   constructor(provider?: EmbedProvider) {
-    this.provider = provider ?? new FastembedEmbedProvider();
+    // All daemon embedding paths share getEmbedProvider(). Previously this
+    // service constructed its own FastembedEmbedProvider while cache/crawl
+    // paths used the provider factory, allowing two native ONNX sessions in
+    // one process. Injected providers remain isolated for tests/custom use.
+    this.provider = provider ?? null;
+    this.resolveProvider = provider
+      ? async () => provider
+      : getEmbedProvider;
   }
 
   /**
@@ -131,11 +142,16 @@ export class EmbeddingService {
       attempt: this.loadAttempts,
     });
     try {
-      await this.provider.embed(['embedding service probe']);
+      // Preserve the synchronous hand-off for injected providers (important
+      // for callers that install an inference gate before yielding), while the
+      // default shared provider still resolves lazily through the factory.
+      const provider = this.provider ?? await this.resolveProvider();
+      this.provider = provider;
+      await provider.embed(['embedding service probe']);
       this.providerVerified = true;
       log.info('embedding provider verified', {
-        modelId: this.provider.modelId,
-        dim: this.provider.dim,
+        modelId: provider.modelId,
+        dim: provider.dim,
       });
       return true;
     } catch (err) {
@@ -168,7 +184,8 @@ export class EmbeddingService {
 
   /** Backwards-compat alias preserved for callers that gated on subprocess readiness. */
   isSubprocessReady(): boolean {
-    return this.providerVerified;
+    const state = this.provider?.getRuntimeState?.();
+    return state ? state.loaded : this.providerVerified;
   }
 
   /**
@@ -207,14 +224,16 @@ export class EmbeddingService {
     }
 
     try {
-      const [vector] = await this.provider.embed([markdown]);
+      const provider = this.provider;
+      if (!provider) return;
+      const [vector] = await provider.embed([markdown]);
       if (!vector || vector.length === 0) {
         log.warn('embedding returned empty vector', { url });
         return;
       }
 
       const buffer = Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength);
-      const model = this.provider.modelId;
+      const model = provider.modelId;
       const dims = vector.length;
 
       let normalizedUrl: string;
@@ -275,7 +294,9 @@ export class EmbeddingService {
     if (!(await this.ensureProviderReady())) return [];
 
     try {
-      const [queryVector] = await this.provider.embed([queryText]);
+      const provider = this.provider;
+      if (!provider) return [];
+      const [queryVector] = await provider.embed([queryText]);
       if (!queryVector || queryVector.length === 0) {
         log.warn('query embedding failed: empty vector');
         return [];
@@ -310,6 +331,7 @@ export class EmbeddingService {
       this.loadAttempts = 0;
       this.lastFailureAt = 0;
       this.latchedOff = false;
+      this.provider = null;
       log.info('EmbeddingService shut down');
     } catch (err) {
       log.error('EmbeddingService shutdown error', { error: String(err) });
@@ -318,7 +340,11 @@ export class EmbeddingService {
 
   private async migrateLegacyEmbeddings(): Promise<void> {
     if (!this.store) return;
-    const legacy = getAllEmbeddings(this.provider.modelId);
+    // The default provider is intentionally unresolved during init so the
+    // native runtime stays cold. Its stable model id is enough to migrate the
+    // prior cache without constructing/loading a second provider.
+    const modelId = this.provider?.modelId ?? DEFAULT_EMBED_PROVIDER_MODEL_ID;
+    const legacy = getAllEmbeddings(modelId);
     if (legacy.length === 0) {
       this.cachedSize = 0;
       return;

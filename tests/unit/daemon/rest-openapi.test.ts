@@ -52,13 +52,14 @@ describe('OpenAPI document assembly', () => {
     expect(doc.info.version).not.toBe('0.0.0');
   });
 
-  it('has a POST path for all 10 tools plus /v1/tools and the openapi aliases', () => {
+  it('has a POST path for all 10 tools plus diagnostics, /v1/tools, and the openapi aliases', () => {
     const doc = buildOpenApi() as { paths: Record<string, Record<string, unknown>> };
     for (const tool of TOOLS) {
       expect(doc.paths[`/v1/${tool}`]).toBeDefined();
       expect(doc.paths[`/v1/${tool}`].post).toBeDefined();
     }
     expect(doc.paths['/v1/tools']).toBeDefined();
+    expect(doc.paths['/v1/diagnostics']?.get).toBeDefined();
     expect(doc.paths['/openapi.json']).toBeDefined();
     expect(doc.paths['/v1/openapi.json']).toBeDefined();
   });

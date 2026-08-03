@@ -1,5 +1,7 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -34,7 +36,6 @@ export class CratesIoEngine implements SearchEngine {
   name = 'crates-io';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const params = new URLSearchParams({
@@ -45,18 +46,20 @@ export class CratesIoEngine implements SearchEngine {
     const url = `https://crates.io/api/v1/crates?${params}`;
     log.debug('crates.io search', { query });
 
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        'User-Agent': 'wigolo/0.1 (https://github.com/KnockOutEZ/wigolo)',
-        Accept: 'application/json',
-      },
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, {
+        signal,
+        headers: {
+          'User-Agent': 'wigolo/0.1 (https://github.com/KnockOutEZ/wigolo)',
+          Accept: 'application/json',
+        },
+      });
+
+      assertUpstreamOk(this.name, response);
+
+      const data = (await response.json()) as CratesIoResponse;
+      return this.parseCrates(data.crates ?? []);
     });
-
-    if (!response.ok) throw new Error(`crates.io returned ${response.status}`);
-
-    const data = (await response.json()) as CratesIoResponse;
-    return this.parseCrates(data.crates ?? []);
   }
 
   private parseCrates(crates: CrateHit[]): RawSearchResult[] {

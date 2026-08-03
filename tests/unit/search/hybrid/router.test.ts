@@ -327,7 +327,7 @@ describe('HybridSearchProvider', () => {
     expect(out.data.fallback_signal).toBeNull();
   });
 
-  it('passes the same context through to both providers', async () => {
+  it('passes only SearXNG to fallback so core HTML engines are not repeated', async () => {
     const core = mockProvider('core', () =>
       ok({
         results: [makeResult('only', 'https://example.com/a', 0.8)],
@@ -338,12 +338,50 @@ describe('HybridSearchProvider', () => {
     );
     const hybrid = new HybridSearchProvider(core, sx);
 
+    const searxngEngine = { name: 'searxng', search: vi.fn(async () => []) };
+    const bingEngine = { name: 'bing', search: vi.fn(async () => []) };
+    const ddgEngine = { name: 'duckduckgo', search: vi.fn(async () => []) };
+    ctx.engines = [searxngEngine, bingEngine, ddgEngine];
+
     await hybrid.search({ query: 'q', include_domains: ['example.com'] }, ctx);
 
     expect(core.search).toHaveBeenCalledWith(
       expect.anything(),
       ctx,
     );
-    expect(sx.search).toHaveBeenCalledWith(expect.anything(), ctx);
+    expect(sx.search).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ engines: [searxngEngine] }),
+    );
+  });
+
+  it('propagates cancellation instead of returning a stale core result during fallback', async () => {
+    const controller = new AbortController();
+    const reason = new DOMException('caller cancelled', 'AbortError');
+    const core = mockProvider('core', () =>
+      ok({ results: [makeResult('only', 'https://example.com/a', 0.8)] }),
+    );
+    const sx: MockProvider = {
+      name: 'searxng',
+      search: vi.fn(async (_input: SearchInput, fallbackCtx: SearchContext) =>
+        new Promise<StageResult<SearchOutput>>((_resolve, reject) => {
+          fallbackCtx.signal?.addEventListener(
+            'abort',
+            () => reject(fallbackCtx.signal?.reason),
+            { once: true },
+          );
+        })),
+    } as MockProvider;
+    const hybrid = new HybridSearchProvider(core, sx);
+    ctx.signal = controller.signal;
+
+    const pending = hybrid.search(
+      { query: 'q', include_domains: ['example.com'] },
+      ctx,
+    );
+    await vi.waitFor(() => expect(sx.search).toHaveBeenCalledOnce());
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
   });
 });

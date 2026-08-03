@@ -1,5 +1,7 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -41,7 +43,6 @@ export class StackOverflowEngine implements SearchEngine {
   name = 'stackoverflow';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const params = new URLSearchParams({
@@ -65,11 +66,13 @@ export class StackOverflowEngine implements SearchEngine {
     const url = `https://api.stackexchange.com/2.3/search/advanced?${params}`;
     log.debug('stackoverflow search', { query });
 
-    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!response.ok) throw new Error(`StackOverflow returned ${response.status}`);
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, { signal });
+      assertUpstreamOk(this.name, response);
 
-    const data = (await response.json()) as SoResponse;
-    return this.parseItems(data.items ?? []);
+      const data = (await response.json()) as SoResponse;
+      return this.parseItems(data.items ?? []);
+    });
   }
 
   private parseItems(items: SoItem[]): RawSearchResult[] {

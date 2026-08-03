@@ -37,6 +37,8 @@ import { DockerSearxng } from './searxng/docker.js';
 import { BackendStatus } from './server/backend-status.js';
 import { maybeEagerWarmup, warmEngines } from './server/warmup-on-start.js';
 import { getEmbeddingService, resetEmbeddingService } from './embedding/embed.js';
+import { disposeEmbedProvider } from './providers/embed-provider.js';
+import { disposeRerankProvider } from './providers/rerank-provider.js';
 import { getConfig } from './config.js';
 import { createLogger } from './logger.js';
 import {
@@ -263,6 +265,10 @@ export async function initSubsystems(): Promise<Subsystems> {
     await browserPool.shutdown();
     await closeDaemonBrowser().catch((e) => log.debug('closeDaemonBrowser failed', { error: e instanceof Error ? e.message : String(e) }));
     resetEmbeddingService();
+    await Promise.allSettled([
+      disposeEmbedProvider(),
+      disposeRerankProvider(),
+    ]);
     closeDatabase();
   }
 
@@ -427,7 +433,15 @@ export function createMcpServer(subsystems: Subsystems): Server {
     if (name === 'search') {
       const input = (args ?? {}) as unknown as SearchInput;
       const samplingServer = server as unknown as SamplingCapableServer;
-      const r = await handleSearch(input, searchEngines, router, backendStatus, samplingServer, onProgress);
+      const r = await handleSearch(
+        input,
+        searchEngines,
+        router,
+        backendStatus,
+        samplingServer,
+        onProgress,
+        extra.signal,
+      );
       if (!r.ok) {
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: r.error, error_reason: r.error_reason, stage: r.stage, ...(r.hint ? { hint: r.hint } : {}) }, null, 2) }],

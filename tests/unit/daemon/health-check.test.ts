@@ -126,6 +126,29 @@ describe('probeHealth — sidecar configured (searxng/hybrid backend or external
     expect(['healthy', 'degraded', 'down']).toContain(report.status);
   });
 
+  it('exposes read-only process memory and live model lifecycle state', () => {
+    const report = probeHealth(makeInput());
+    expect(report.memory).toEqual(expect.objectContaining({
+      rss_bytes: expect.any(Number),
+      heap_total_bytes: expect.any(Number),
+      heap_used_bytes: expect.any(Number),
+      external_bytes: expect.any(Number),
+      array_buffers_bytes: expect.any(Number),
+    }));
+    expect(report.models.embedding).toEqual(expect.objectContaining({
+      state: expect.any(String),
+      loaded: expect.any(Boolean),
+      in_flight: expect.any(Number),
+      idle_timeout_ms: expect.any(Number),
+    }));
+    expect(report.models.reranker).toEqual(expect.objectContaining({
+      state: expect.any(String),
+      loaded: expect.any(Boolean),
+      in_flight: expect.any(Number),
+      idle_timeout_ms: expect.any(Number),
+    }));
+  });
+
   it('handles startedAt=0 gracefully', () => {
     const report = probeHealth(makeInput({
       startedAt: 0,

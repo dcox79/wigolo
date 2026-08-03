@@ -36,6 +36,7 @@ import {
 export interface DispatchContext {
   subsystems: Subsystems;
   bindIsLoopback: boolean;
+  signal?: AbortSignal;
 }
 
 export interface DispatchResult {
@@ -124,7 +125,15 @@ async function dispatchSearch(input: SearchInput, ctx: DispatchContext): Promise
   const { searchEngines, router, backendStatus } = ctx.subsystems;
   // Serve mode has no client sampling channel, but the handler can still use a
   // configured server-side LLM before falling back to assembled evidence.
-  const r = await handleSearch(input, searchEngines, router, backendStatus, undefined as unknown as SamplingCapableServer);
+  const r = await handleSearch(
+    input,
+    searchEngines,
+    router,
+    backendStatus,
+    undefined as unknown as SamplingCapableServer,
+    undefined,
+    ctx.signal,
+  );
   if (!r.ok) return stageFailure(r);
   const remap = statusForSearchData(r.data as { error?: unknown; warning?: unknown });
   if (remap !== null) {

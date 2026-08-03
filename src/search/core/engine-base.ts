@@ -4,6 +4,13 @@ import type {
   RawSearchResult,
 } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { anySignal } from '../../util/abort.js';
+import {
+  getEngineBulkheadSnapshot,
+  isConcurrencyLimitedError,
+  resetEngineBulkheads,
+} from './engine-bulkhead.js';
+import { UpstreamHttpError } from '../engines/upstream-error.js';
 
 const log = createLogger('search');
 
@@ -70,11 +77,17 @@ export interface EngineOutcome {
   /** Remaining breaker cooldown in ms, set only when skipped. */
   cooldownRemainingMs?: number;
   /** True when the engine was still in flight at the pool's soft deadline
-   * (or its tighter chronic budget) and was abandoned so a straggler could
-   * not drag the overall response. Its underlying request keeps running and
-   * its own abort timeout still fires; a late result may populate cache but
-   * is not awaited. */
+   * (or its tighter chronic budget). The per-engine signal is aborted before
+   * the timed-out outcome is returned. */
   timedOut?: boolean;
+  /** Stable machine-readable dispatch classification. */
+  reason?:
+    | 'rate_limited'
+    | 'breaker_open'
+    | 'concurrency_limited'
+    | 'soft_deadline'
+    | 'upstream_timeout'
+    | 'recovery_probe';
 }
 
 /** Options for {@link runEnginesParallel} that bound how long the pool waits. */
@@ -89,6 +102,8 @@ export interface RunEnginesOptions {
    * transiently-slow-once engine keeps the full pool deadline. Generic and
    * data-driven — keyed on observed session trips, never an engine name. */
   chronicSoftDeadlineMs?: number;
+  /** Marks this dispatch as the single degraded-recovery probe wave. */
+  recoveryProbe?: boolean;
 }
 
 export interface BreakerConfig {
@@ -200,6 +215,11 @@ export type FailureClass = 'rate-limit' | 'forbidden' | 'other';
  * limit" / "too many requests") is transient; `forbidden` (403 / "forbidden")
  * is a reputational block; everything else is `other`. Pure + engine-agnostic. */
 export function classifyFailure(err: unknown): FailureClass {
+  if (err instanceof UpstreamHttpError) {
+    if (err.status === 429) return 'rate-limit';
+    if (err.status === 403) return 'forbidden';
+    return 'other';
+  }
   const message = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (/\b429\b/.test(message) || /rate.?limit|too many requests/.test(message)) {
     return 'rate-limit';
@@ -320,6 +340,7 @@ function recordSuccess(name: string): void {
  * engine pool that collapsed under a burst. Also the reset used by tests. */
 export function resetBreakers(): void {
   breakers.clear();
+  resetEngineBulkheads();
 }
 
 /** Delegating alias kept for the many test files that import it. Renaming
@@ -353,6 +374,19 @@ export interface BreakerSnapshotEntry {
   lastError?: string;
 }
 
+export interface LiveEngineStateEntry {
+  engine: string;
+  breaker: BreakerSnapshotState;
+  failures: number;
+  cooldownRemainingMs: number;
+  /** Null for engines without a configured bulkhead. */
+  limit: number | null;
+  inFlight: number;
+  queued: number;
+  /** Epoch milliseconds. Zero means no upstream quota window is active. */
+  nextAllowedAt: number;
+}
+
 /**
  * Point-in-time view of every breaker that has seen at least one call.
  * `half-open` = cooldown elapsed but the breaker has not closed yet (probe
@@ -369,6 +403,31 @@ export function getBreakerSnapshot(): BreakerSnapshotEntry[] {
       failures: s.failures,
       cooldownRemainingMs: state === 'open' ? s.tripUntil - now : 0,
       ...(s.lastError ? { lastError: s.lastError } : {}),
+    };
+  });
+}
+
+/** Read-only process-wide breaker + admission snapshot for authenticated
+ * health/diagnostics surfaces. Calling it never creates or mutates state. */
+export function getLiveEngineStateSnapshot(): LiveEngineStateEntry[] {
+  const breakerByName = new Map(getBreakerSnapshot().map((entry) => [entry.engine, entry]));
+  const bulkheadByName = new Map(
+    getEngineBulkheadSnapshot().map((entry) => [entry.engine, entry]),
+  );
+  const names = new Set([...breakerByName.keys(), ...bulkheadByName.keys()]);
+
+  return [...names].sort().map((engine) => {
+    const breaker = breakerByName.get(engine);
+    const bulkhead = bulkheadByName.get(engine);
+    return {
+      engine,
+      breaker: breaker?.state ?? 'closed',
+      failures: breaker?.failures ?? 0,
+      cooldownRemainingMs: breaker?.cooldownRemainingMs ?? 0,
+      limit: bulkhead?.limit ?? null,
+      inFlight: bulkhead?.inFlight ?? 0,
+      queued: bulkhead?.queued ?? 0,
+      nextAllowedAt: bulkhead?.nextAllowedAt ?? 0,
     };
   });
 }
@@ -396,6 +455,64 @@ export class ThrottledError extends BreakerOpenError {
     this.name = 'ThrottledError';
     this.message = `throttled: engine ${name} called within its minimum interval`;
   }
+}
+
+function isCallerCancellation(error: unknown, signal?: AbortSignal): boolean {
+  if (!signal?.aborted) return false;
+  return error === signal.reason ||
+    (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError'));
+}
+
+function isRetryableFailure(error: unknown): boolean {
+  if (error instanceof UpstreamHttpError) return error.retryable;
+  if (error instanceof SyntaxError) return false;
+  if (error instanceof Error) {
+    if (error.name === 'AbortError') return false;
+    if (error.name === 'TimeoutError') return true;
+    // Backward-compatible guard for third-party adapters that have not yet
+    // adopted UpstreamHttpError: never retry an ordinary textual 4xx.
+    const status = error.message.match(/\b(4\d\d)\b/)?.[1];
+    if (status && status !== '403' && status !== '429') return false;
+  }
+  // Fetch implementations surface network failures as TypeError or Error
+  // with platform-specific messages/codes. Unknown non-HTTP adapter errors
+  // retain the historical single retry for plugin compatibility.
+  return true;
+}
+
+function retryDelayMs(
+  error: unknown,
+  attempt: number,
+  minIntervalRemainingMs: number,
+): number {
+  const normalBackoff = Math.min(
+    RETRY_BACKOFF_BASE_MS * 3 ** (attempt - 1),
+    MAX_RETRY_BACKOFF_MS,
+  );
+  const upstreamBackoff = error instanceof UpstreamHttpError && error.status === 429
+    ? (error.retryAfterMs ?? normalBackoff)
+    : normalBackoff;
+  return Math.max(upstreamBackoff, minIntervalRemainingMs);
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 export function wrapWithRetryAndBreaker(
@@ -457,6 +574,7 @@ export function wrapWithRetryAndBreaker(
       }
 
       let lastErr: unknown;
+      let fingerprint403Retried = false;
       for (let attempt = 1; attempt <= retryAttempts; attempt++) {
         try {
           const results = await engine.search(query, options);
@@ -464,17 +582,43 @@ export function wrapWithRetryAndBreaker(
           return results;
         } catch (err) {
           lastErr = err;
-          if (attempt < retryAttempts) {
-            // Let the engine react to the retryable error before the next
-            // attempt (e.g. rotate its browser fingerprint on a 403).
-            onRetry?.(attempt, err);
-            const backoffMs = Math.min(
-              RETRY_BACKOFF_BASE_MS * 3 ** (attempt - 1),
-              MAX_RETRY_BACKOFF_MS,
-            );
-            await new Promise((r) => setTimeout(r, backoffMs));
+          if (isCallerCancellation(err, options?.signal)) break;
+          if (attempt >= retryAttempts || !isRetryableFailure(err)) break;
+
+          const is403 = err instanceof UpstreamHttpError
+            ? err.status === 403
+            : err instanceof Error && /\b403\b|forbidden/i.test(err.message);
+          if (is403) {
+            // A reputational 403 may get exactly one fresh browser
+            // fingerprint. A quota 429 never enters this branch and therefore
+            // never rotates user agents.
+            if (!onRetry || fingerprint403Retried) break;
+            fingerprint403Retried = true;
+            onRetry(attempt, err);
           }
+
+          const minIntervalRemainingMs = minIntervalMs > 0
+            ? Math.max(0, minIntervalMs - (Date.now() - state.lastDispatchAt))
+            : 0;
+          const backoffMs = retryDelayMs(err, attempt, minIntervalRemainingMs);
+          try {
+            await abortableDelay(backoffMs, options?.signal);
+          } catch (abortError) {
+            lastErr = abortError;
+            break;
+          }
+          // Advance the throttle clock for the actual retry dispatch. This
+          // closes the old loophole where attempt two bypassed the 2s gate.
+          state.lastDispatchAt = Date.now();
         }
+      }
+
+      if (isCallerCancellation(lastErr, options?.signal)) {
+        if (probe) {
+          state.probing = false;
+          state.probeStartedAt = 0;
+        }
+        throw lastErr;
       }
 
       state.lastError = sanitizeErrorMessage(
@@ -501,6 +645,21 @@ export function wrapWithRetryAndBreaker(
  * engine result — a plain value could collide with an engine's payload. */
 const SOFT_DEADLINE = Symbol('soft-deadline');
 
+function failureReason(
+  error: unknown,
+  recoveryProbe: boolean,
+): EngineOutcome['reason'] | undefined {
+  if (error instanceof ThrottledError) return 'rate_limited';
+  if (error instanceof BreakerOpenError) return 'breaker_open';
+  if (isConcurrencyLimitedError(error)) return 'concurrency_limited';
+  if (error instanceof UpstreamHttpError) {
+    if (error.status === 429) return 'rate_limited';
+    if (error.status === 504) return 'upstream_timeout';
+  }
+  if (error instanceof Error && error.name === 'TimeoutError') return 'upstream_timeout';
+  return recoveryProbe ? 'recovery_probe' : undefined;
+}
+
 export async function runEnginesParallel(
   entries: EngineEntry[],
   query: string,
@@ -509,33 +668,48 @@ export async function runEnginesParallel(
 ): Promise<EngineOutcome[]> {
   const softDeadlineMs = runOptions?.softDeadlineMs;
   const chronicSoftDeadlineMs = runOptions?.chronicSoftDeadlineMs;
+  const recoveryProbe = runOptions?.recoveryProbe ?? false;
 
   const promises = entries.map((entry): Promise<EngineOutcome> => {
     const name = entry.engine.name;
     const start = Date.now();
-    const settled = entry.engine
-      .search(query, options)
+    const deadlineController = softDeadlineMs && softDeadlineMs > 0
+      ? new AbortController()
+      : undefined;
+    const combined = deadlineController && options?.signal
+      ? anySignal([options.signal, deadlineController.signal])
+      : undefined;
+    const engineSignal = combined?.signal ?? deadlineController?.signal ?? options?.signal;
+    const engineOptions = engineSignal === options?.signal
+      ? options
+      : { ...options, signal: engineSignal };
+    const settled = Promise.resolve()
+      .then(() => entry.engine.search(query, engineOptions))
       .then(
         (results): EngineOutcome => ({
           engine: name,
           ok: true,
           results,
           latencyMs: Date.now() - start,
+          ...(recoveryProbe ? { reason: 'recovery_probe' as const } : {}),
         }),
         (err): EngineOutcome => {
           const message = err instanceof Error ? err.message : String(err);
+          const reason = failureReason(err, recoveryProbe);
           return {
             engine: name,
             ok: false,
             results: [],
             error: message,
             latencyMs: Date.now() - start,
+            ...(reason ? { reason } : {}),
             ...(err instanceof BreakerOpenError
               ? { skipped: true, cooldownRemainingMs: err.cooldownRemainingMs }
               : {}),
           };
         },
       );
+    void settled.finally(() => combined?.cleanup());
 
     // No soft deadline (or a zero/negative one): legacy behaviour — await the
     // engine directly so we wait for the slowest.
@@ -548,15 +722,21 @@ export async function runEnginesParallel(
         ? Math.min(chronicSoftDeadlineMs, softDeadlineMs)
         : softDeadlineMs;
 
-    // Prevent the abandoned engine promise from becoming an unhandled
-    // rejection: its late error is swallowed here (the outcome is already
-    // recorded as timedOut). A late SUCCESS still resolves and any cache
-    // side-effects in the adapter already ran.
-    settled.catch(() => {});
+    // The adapter receives the deadline signal, so a deadline win cancels the
+    // underlying request. `settled` maps rejection to an EngineOutcome and
+    // therefore cannot become unhandled while the race resolves.
 
     let deadlineTimer: ReturnType<typeof setTimeout>;
     const deadline = new Promise<typeof SOFT_DEADLINE>((resolve) => {
-      deadlineTimer = setTimeout(() => resolve(SOFT_DEADLINE), budget);
+      deadlineTimer = setTimeout(() => {
+        deadlineController?.abort(
+          new DOMException(
+            `soft-deadline timeout after ${budget}ms`,
+            'TimeoutError',
+          ),
+        );
+        resolve(SOFT_DEADLINE);
+      }, budget);
     });
 
     return Promise.race([settled, deadline]).then((r): EngineOutcome => {
@@ -571,10 +751,11 @@ export async function runEnginesParallel(
             results: [],
             error: 'soft-deadline timeout: engine did not respond within the pool budget',
             // latencyMs here is the pool's observed WAIT (≈ the budget), not
-            // the engine's true response time — the request was abandoned in
-            // flight and may still be running.
+            // the engine's true response time — cancellation was requested
+            // here and adapter cleanup may still be unwinding.
             latencyMs: Date.now() - start,
             timedOut: true,
+            reason: 'soft_deadline',
           }
         : (r as EngineOutcome);
     });

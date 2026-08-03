@@ -1,6 +1,8 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
 import { getConfig } from '../../config.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -30,7 +32,6 @@ export class BraveEngine implements SearchEngine {
     if (!apiKey) {
       throw new Error('BRAVE_API_KEY not set');
     }
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = Math.min(options.maxResults ?? 10, 20);
 
     const params = new URLSearchParams({
@@ -45,18 +46,20 @@ export class BraveEngine implements SearchEngine {
 
     log.debug('querying brave api', { query });
 
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        'X-Subscription-Token': apiKey,
-        'Accept': 'application/json',
-      },
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, {
+        signal,
+        headers: {
+          'X-Subscription-Token': apiKey,
+          'Accept': 'application/json',
+        },
+      });
+
+      assertUpstreamOk(this.name, response);
+
+      const body = (await response.json()) as BraveSearchResponse;
+      return this.parseResults(body, maxResults);
     });
-
-    if (!response.ok) throw new Error(`Brave returned ${response.status}`);
-
-    const body = (await response.json()) as BraveSearchResponse;
-    return this.parseResults(body, maxResults);
   }
 
   parseResults(body: BraveSearchResponse, maxResults: number): RawSearchResult[] {

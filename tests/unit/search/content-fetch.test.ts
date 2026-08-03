@@ -391,6 +391,30 @@ describe('fetchContentForResults — stage budget abort orchestration', () => {
     expect(captured?.aborted).toBe(true);
   });
 
+  it('propagates top-level cancellation and does not start backup waves', async () => {
+    const controller = new AbortController();
+    const reason = new DOMException('client disconnected', 'AbortError');
+    let captured: AbortSignal | undefined;
+    const router = mockRouter((_url, opts) => {
+      captured = opts.signal;
+      return new Promise((_, reject) => {
+        opts.signal?.addEventListener('abort', () => reject(opts.signal!.reason), { once: true });
+      });
+    });
+    const results = [item('top-1'), item('top-2'), item('backup')];
+    const pending = fetchContentForResults(
+      results,
+      router,
+      baseCtx({ maxFetches: 2, signal: controller.signal }),
+    );
+    await vi.waitFor(() => expect(captured).toBeDefined());
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(captured?.aborted).toBe(true);
+    expect((router.fetch as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(2);
+  });
+
   it('per-URL timeout flags timeout (distinct from stage_timeout)', async () => {
     vi.useFakeTimers();
     // perUrl 3000 < stage 10000: a single slow URL trips the per-URL leg first

@@ -68,6 +68,7 @@ vi.mock('../../../src/search/core/verticals/images.js', () => ({
 }));
 
 const { runV1Search } = await import('../../../src/search/core/orchestrator.js');
+const { CoreSearchProvider } = await import('../../../src/search/core/core-provider.js');
 const { _resetBreakersForTest } = await import('../../../src/search/core/engine-base.js');
 
 function makeResult(engineName: string, url: string): RawSearchResult {
@@ -222,5 +223,34 @@ describe('degraded-dispatch recovery wave', () => {
     expect(out.results.some((r) => r.url === 'https://good.com/1')).toBe(true);
     expect(out.results.some((r) => r.url === 'https://good.com/2')).toBe(true);
     expect(out.results.some((r) => r.url === 'https://noise.com/1')).toBe(false);
+  });
+
+  it('runs at most one recovery wave across a five-variant top-level search', async () => {
+    const survivor: EngineEntry = {
+      engine: {
+        name: 'bing',
+        search: vi.fn(async (query: string) => [
+          makeResult('bing', `https://survivor.example/${encodeURIComponent(query)}`),
+        ]),
+      },
+      quality: 'medium',
+    };
+    const emptyA = emptyEntry('ddg');
+    const emptyB = emptyEntry('wikipedia');
+    const probe = probeOnlyEntry('mojeek', [makeResult('mojeek', 'https://probe.example/once')]);
+    verticalState.general = [survivor, emptyA, emptyB, probe];
+
+    const provider = new CoreSearchProvider();
+    await provider.search(
+      {
+        query: ['variant one', 'variant two', 'variant three', 'variant four', 'variant five'],
+        force_refresh: true,
+        search_depth: 'fast',
+        include_content: false,
+      },
+      { router: undefined } as never,
+    );
+
+    expect(probe.engine.search).toHaveBeenCalledTimes(1);
   });
 });

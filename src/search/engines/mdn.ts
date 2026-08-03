@@ -1,5 +1,7 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -23,7 +25,6 @@ export class MdnEngine implements SearchEngine {
   name = 'mdn';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const params = new URLSearchParams({
@@ -34,11 +35,13 @@ export class MdnEngine implements SearchEngine {
     const url = `${MDN_HOST}/api/v1/search?${params}`;
     log.debug('mdn search', { query });
 
-    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!response.ok) throw new Error(`MDN returned ${response.status}`);
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, { signal });
+      assertUpstreamOk(this.name, response);
 
-    const data = (await response.json()) as MdnResponse;
-    return this.parseDocs(data.documents ?? []);
+      const data = (await response.json()) as MdnResponse;
+      return this.parseDocs(data.documents ?? []);
+    });
   }
 
   private parseDocs(docs: MdnDoc[]): RawSearchResult[] {

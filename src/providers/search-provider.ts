@@ -20,6 +20,8 @@ export interface SearchContext {
   backendStatus?: BackendStatus;
   samplingServer?: SamplingCapableServer;
   onProgress?: ProgressCallback;
+  /** Cancels queued query variants and every in-flight upstream engine call. */
+  signal?: AbortSignal;
 }
 
 export interface SearchProvider {

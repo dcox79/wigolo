@@ -202,6 +202,10 @@ export interface OrchestratorInput {
    * result whose title+snippet does not contain the unquoted query as a
    * case-insensitive substring is dropped post-rerank. */
   exactMatch?: boolean;
+  /** Request cancellation propagated to every adapter fetch. */
+  signal?: AbortSignal;
+  /** Mutable per-top-level-search recovery budget shared by query variants. */
+  recoveryBudget?: { claimed: boolean };
 }
 
 export interface OrchestratorOutput {
@@ -298,6 +302,10 @@ export async function runV1Search(
   input: OrchestratorInput,
   opts: RunV1SearchOptions = {},
 ): Promise<OrchestratorOutput> {
+  // Allocate once for direct orchestrator callers, then explicitly thread the
+  // same object through recursive vertical fallback. CoreSearchProvider passes
+  // one shared object across all concurrently dispatched query variants.
+  const recoveryBudget = input.recoveryBudget ?? { claimed: false };
   const query = typeof input.query === 'string' ? input.query.trim() : '';
   if (query.length === 0) {
     log.warn('orchestrator received empty query');
@@ -370,6 +378,7 @@ export async function runV1Search(
     country: input.country,
     timeRange: input.timeRange,
     category: vertical === 'general' ? undefined : vertical,
+    signal: input.signal,
   };
 
   // Soft deadline shared by every dispatch wave: bound the overall wait so one
@@ -621,8 +630,10 @@ export async function runV1Search(
   if (
     outcomes.length > 0 &&
     primaryHealthy < poolHealthFloor(outcomes.length) &&
-    recoveryEntries.length > 0
+    recoveryEntries.length > 0 &&
+    recoveryBudget.claimed !== true
   ) {
+    recoveryBudget.claimed = true;
     log.info('pool degraded below floor, running recovery wave', {
       vertical,
       primaryHealthy,
@@ -633,7 +644,7 @@ export async function runV1Search(
       recoveryEntries,
       primaryDispatchQuery,
       options,
-      runOptions,
+      { ...runOptions, recoveryProbe: true },
     );
     allOutcomes.push(...recoveryOutcomes);
     wavedEntries.push(...recoveryEntries);
@@ -792,7 +803,10 @@ export async function runV1Search(
   // morphing into a general search.
   if (degraded && vertical !== 'general' && vertical !== 'images' && !opts._isFallback) {
     log.info('vertical degraded, falling back to general', { from: vertical });
-    return runV1Search({ ...input, category: 'general' }, { _isFallback: true });
+    return runV1Search(
+      { ...input, category: 'general', recoveryBudget },
+      { _isFallback: true },
+    );
   }
 
   return {

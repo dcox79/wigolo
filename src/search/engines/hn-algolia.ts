@@ -1,5 +1,7 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -38,7 +40,6 @@ export class HnAlgoliaEngine implements SearchEngine {
   name = 'hn-algolia';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const params = new URLSearchParams({
@@ -63,11 +64,13 @@ export class HnAlgoliaEngine implements SearchEngine {
     const url = `https://hn.algolia.com/api/v1/search?${params}`;
     log.debug('hn algolia search', { query });
 
-    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!response.ok) throw new Error(`HN Algolia returned ${response.status}`);
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, { signal });
+      assertUpstreamOk(this.name, response);
 
-    const data = (await response.json()) as HnResponse;
-    return this.parseHits(data.hits ?? []);
+      const data = (await response.json()) as HnResponse;
+      return this.parseHits(data.hits ?? []);
+    });
   }
 
   private parseHits(hits: HnHit[]): RawSearchResult[] {

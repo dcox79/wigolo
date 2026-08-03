@@ -1,5 +1,7 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -41,45 +43,46 @@ export class DdgImageEngine implements SearchEngine {
   name = 'ddg-image';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
-    log.debug('ddg-image: bootstrapping vqd token', { query });
-    const bootstrapUrl = `https://duckduckgo.com/?q=${encodeURIComponent(query)}&iax=images&ia=images`;
-    const bootstrap = await fetch(bootstrapUrl, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: { 'User-Agent': ua, 'Accept': 'text/html' },
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      log.debug('ddg-image: bootstrapping vqd token', { query });
+      const bootstrapUrl = `https://duckduckgo.com/?q=${encodeURIComponent(query)}&iax=images&ia=images`;
+      const bootstrap = await fetch(bootstrapUrl, {
+        signal,
+        headers: { 'User-Agent': ua, 'Accept': 'text/html' },
+      });
+      assertUpstreamOk(this.name, bootstrap);
+      const html = await bootstrap.text();
+      const vqd = this.extractVqd(html);
+      if (!vqd) throw new Error('DDG image bootstrap missing vqd token');
+
+      // Build the i.js URL. Region+locale `kl` is wired from options.country if
+      // present, falling back to us-en — matches the DuckDuckGoEngine pattern.
+      const lang = (options.language ?? 'en').slice(0, 2).toLowerCase();
+      const region = options.country ? `${options.country.toLowerCase()}-${lang}` : 'us-en';
+      const ijsUrl =
+        `https://duckduckgo.com/i.js?l=${region}` +
+        `&o=json&q=${encodeURIComponent(query)}&vqd=${vqd}&f=,,,,,&p=1`;
+
+      log.debug('ddg-image: fetching i.js', { region });
+      const response = await fetch(ijsUrl, {
+        signal,
+        headers: {
+          'User-Agent': ua,
+          'Accept': 'application/json',
+          // DDG sets a strict referer check on i.js; without it the endpoint
+          // returns an HTML error page that breaks JSON parsing.
+          'Referer': 'https://duckduckgo.com/',
+        },
+      });
+      assertUpstreamOk(this.name, response);
+
+      const body = (await response.json()) as DdgImageBody;
+      return this.parseResults(body, maxResults);
     });
-    if (!bootstrap.ok) throw new Error(`DDG image bootstrap returned ${bootstrap.status}`);
-    const html = await bootstrap.text();
-    const vqd = this.extractVqd(html);
-    if (!vqd) throw new Error('DDG image bootstrap missing vqd token');
-
-    // Build the i.js URL. Region+locale `kl` is wired from options.country if
-    // present, falling back to us-en — matches the DuckDuckGoEngine pattern.
-    const lang = (options.language ?? 'en').slice(0, 2).toLowerCase();
-    const region = options.country ? `${options.country.toLowerCase()}-${lang}` : 'us-en';
-    const ijsUrl =
-      `https://duckduckgo.com/i.js?l=${region}` +
-      `&o=json&q=${encodeURIComponent(query)}&vqd=${vqd}&f=,,,,,&p=1`;
-
-    log.debug('ddg-image: fetching i.js', { region });
-    const response = await fetch(ijsUrl, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        'User-Agent': ua,
-        'Accept': 'application/json',
-        // DDG sets a strict referer check on i.js; without it the endpoint
-        // returns an HTML error page that breaks JSON parsing.
-        'Referer': 'https://duckduckgo.com/',
-      },
-    });
-    if (!response.ok) throw new Error(`DDG image returned ${response.status}`);
-
-    const body = (await response.json()) as DdgImageBody;
-    return this.parseResults(body, maxResults);
   }
 
   /**

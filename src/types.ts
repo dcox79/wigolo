@@ -420,6 +420,14 @@ export interface ImageSearchResult extends RawSearchResult {
   height?: number;
 }
 
+export type EngineTelemetryReason =
+  | 'rate_limited'
+  | 'breaker_open'
+  | 'concurrency_limited'
+  | 'soft_deadline'
+  | 'upstream_timeout'
+  | 'recovery_probe';
+
 export interface EngineOutcomeSummary {
   engine: string;
   ok: boolean;
@@ -427,6 +435,7 @@ export interface EngineOutcomeSummary {
   result_count: number;
   error?: string;
   skipped?: boolean;
+  reason?: EngineTelemetryReason;
 }
 
 export interface EngineTelemetry {
@@ -438,9 +447,8 @@ export interface EngineTelemetry {
    * landed in the final fused list. */
   dedup_kept: number;
   error?: string;
-  /** Why the engine was skipped. Only emitted when the circuit breaker
-   * rejected dispatch. */
-  reason?: 'breaker_open';
+  /** Stable dispatch/failure classification. */
+  reason?: EngineTelemetryReason;
   /** Remaining breaker cooldown in ms when reason === 'breaker_open'. */
   cooldown_remaining_ms?: number;
 }
@@ -906,6 +914,10 @@ export interface SearchEngineOptions {
   timeRange?: string;
   language?: string;
   timeoutMs?: number;
+  /** Cancels queued engine admission, the upstream fetch, and response-body
+   * consumption. Callers that also set timeoutMs get the earliest of the
+   * caller cancellation and the adapter's own timeout. */
+  signal?: AbortSignal;
   // v2 additions:
   includeDomains?: string[];
   excludeDomains?: string[];

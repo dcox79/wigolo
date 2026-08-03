@@ -34,10 +34,13 @@ export function nextUserAgent(previous?: string): string {
 
 /**
  * True when an engine error looks like a block the client can retry against
- * with a fresh fingerprint — an upstream 403 (forbidden / reputation) or 429
- * (rate limit). Keyed on error class, never on a specific engine.
+ * with a fresh fingerprint — an upstream 403 (forbidden / reputation).
+ * Quota-based 429s intentionally do not rotate fingerprints.
  */
 export function isBlockedError(err: unknown): boolean {
+  if (err && typeof err === 'object' && 'status' in err) {
+    return (err as { status?: unknown }).status === 403;
+  }
   const message = err instanceof Error ? err.message : String(err);
-  return /\b(403|429)\b/.test(message) || /forbidden|blocked|rate.?limit/i.test(message);
+  return /\b403\b/.test(message) || /forbidden|blocked/i.test(message);
 }

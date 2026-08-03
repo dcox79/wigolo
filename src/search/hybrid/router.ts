@@ -79,8 +79,18 @@ export class HybridSearchProvider implements SearchProvider {
 
     let searxngResult: StageResult<SearchOutput>;
     try {
-      searxngResult = await this.searxng.search(input, ctx);
+      // Hybrid fallback is the SearXNG tier only. The legacy provider normally
+      // receives a mixed roster (SearXNG + raw Bing/DDG + plugins); passing that
+      // roster here repeated the same HTML engines core already queried.
+      const searxngOnlyContext: SearchContext = {
+        ...ctx,
+        engines: ctx.engines.filter((engine) => engine.name === 'searxng'),
+      };
+      searxngResult = await this.searxng.search(input, searxngOnlyContext);
     } catch (err) {
+      if (ctx.signal?.aborted) {
+        throw ctx.signal.reason ?? new DOMException('search aborted', 'AbortError');
+      }
       log.warn('searxng fallback threw; returning core result', {
         error: String(err),
         signals: fired,

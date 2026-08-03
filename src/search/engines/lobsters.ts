@@ -1,5 +1,7 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -39,7 +41,6 @@ export class LobstersEngine implements SearchEngine {
   name = 'lobsters';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const params = new URLSearchParams({ q: query, what: 'stories' });
@@ -51,20 +52,22 @@ export class LobstersEngine implements SearchEngine {
     // really "lobsters 400 on every request, more visible on multi-word
     // queries that exercise the engine more often". A stable identifier
     // restores 200s.
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'wigolo/0.1 (https://github.com/KnockOutEZ/wigolo)',
-      },
-    });
-    if (!response.ok) throw new Error(`Lobsters returned ${response.status}`);
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, {
+        signal,
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'wigolo/0.1 (https://github.com/KnockOutEZ/wigolo)',
+        },
+      });
+      assertUpstreamOk(this.name, response);
 
-    const data = (await response.json()) as unknown;
-    const hits = extractHits(data);
-    const mapped = this.parseHits(hits);
-    const filtered = applyDateFilter(mapped, options);
-    return filtered.slice(0, maxResults);
+      const data = (await response.json()) as unknown;
+      const hits = extractHits(data);
+      const mapped = this.parseHits(hits);
+      const filtered = applyDateFilter(mapped, options);
+      return filtered.slice(0, maxResults);
+    });
   }
 
   private parseHits(hits: LobsterHit[]): RawSearchResult[] {

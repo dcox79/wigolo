@@ -2,6 +2,8 @@ import { parseHTML } from 'linkedom';
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
 import { nextUserAgent, isBlockedError } from './user-agents.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -70,7 +72,6 @@ export class BingEngine implements SearchEngine {
   }
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const params = new URLSearchParams({ q: query });
@@ -90,18 +91,20 @@ export class BingEngine implements SearchEngine {
 
     log.debug('scraping bing', { query });
 
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        'User-Agent': this.userAgent,
-        'Accept-Language': options.language ?? 'en-US,en;q=0.9',
-      },
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, {
+        signal,
+        headers: {
+          'User-Agent': this.userAgent,
+          'Accept-Language': options.language ?? 'en-US,en;q=0.9',
+        },
+      });
+
+      assertUpstreamOk(this.name, response);
+
+      const html = await response.text();
+      return this.parseResults(html, maxResults);
     });
-
-    if (!response.ok) throw new Error(`Bing returned ${response.status}`);
-
-    const html = await response.text();
-    return this.parseResults(html, maxResults);
   }
 
   parseResults(html: string, maxResults: number): RawSearchResult[] {

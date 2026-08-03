@@ -7,6 +7,7 @@ export class RssFeedEngine implements SearchEngine {
   name = 'rss-feed';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
+    options.signal?.throwIfAborted();
     const items = queryFeedStore(query, {
       maxResults: options.maxResults ?? 10,
       ...(options.fromDate ? { fromDate: options.fromDate } : {}),
@@ -14,6 +15,7 @@ export class RssFeedEngine implements SearchEngine {
     });
     const total = items.length;
     return items.map((it, i) => {
+      options.signal?.throwIfAborted();
       const result: RawSearchResult = {
         title: it.title,
         url: it.link,

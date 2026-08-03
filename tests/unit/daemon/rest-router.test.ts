@@ -123,6 +123,26 @@ describe('RestRouter — routing basics', () => {
     expect(Array.isArray(out.body)).toBe(true);
   });
 
+  it('GET /v1/diagnostics exposes read-only engine, browser, model, and memory state', async () => {
+    const router = loopbackRouter();
+    const { res, get } = makeRes();
+    await router.handle(makeReq({ method: 'GET', url: '/v1/diagnostics' }), res);
+    const out = get();
+    expect(out.status).toBe(200);
+    expect(out.body).toEqual(expect.objectContaining({
+      status: 'ok',
+      memory: expect.objectContaining({ rss_bytes: expect.any(Number) }),
+      models: expect.objectContaining({ embedding: expect.any(Object), reranker: expect.any(Object) }),
+      engines: expect.any(Array),
+      browser_capacity: expect.objectContaining({
+        limit: expect.any(Number),
+        inFlight: expect.any(Number),
+        queued: expect.any(Number),
+      }),
+    }));
+    expect(JSON.stringify(out.body)).not.toContain('lastError');
+  });
+
   it('GET /openapi.json → 200 object; alias /v1/openapi.json identical', async () => {
     const router = loopbackRouter();
     const a = makeRes();
@@ -226,6 +246,26 @@ describe('RestRouter — auth ordering (stub route sits behind checks)', () => {
     await router.handle(makeReq({ method: 'GET', url: '/openapi.json', headers: { host: 'remote.host' } }), res);
     expect(get().status).toBe(401);
   });
+
+  it('token mode /v1/diagnostics requires a valid bearer token', async () => {
+    const router = new RestRouter({
+      subsystems: fakeSubsystems(),
+      bindHost: '127.0.0.1',
+      token: 'secret',
+      allowUnauthenticated: false,
+    });
+    const denied = makeRes();
+    await router.handle(makeReq({ method: 'GET', url: '/v1/diagnostics' }), denied.res);
+    expect(denied.get().status).toBe(401);
+
+    const allowed = makeRes();
+    await router.handle(makeReq({
+      method: 'GET',
+      url: '/v1/diagnostics',
+      headers: { authorization: 'Bearer secret' },
+    }), allowed.res);
+    expect(allowed.get().status).toBe(200);
+  });
 });
 
 describe('RestRouter — concurrency', () => {
@@ -273,7 +313,9 @@ describe('RestRouter — deadline', () => {
     process.env.WIGOLO_SERVE_TIMEOUT_SCALE = '0.0001'; // ~6ms for a 60s route
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
-    vi.mocked(dispatchTool).mockImplementation(async () => {
+    let requestSignal: AbortSignal | undefined;
+    vi.mocked(dispatchTool).mockImplementation(async (_tool, _body, ctx) => {
+      requestSignal = ctx.signal;
       await gate;
       return { status: 200, body: { ok: true } };
     });
@@ -281,6 +323,7 @@ describe('RestRouter — deadline', () => {
     const first = makeRes();
     await router.handle(makeReq({ url: '/v1/search', body: JSON.stringify({ query: 'x' }) }), first.res);
     expect(first.get().status).toBe(504);
+    expect(requestSignal?.aborted).toBe(true);
 
     // Slot still held → next request 429.
     const second = makeRes();
@@ -294,5 +337,25 @@ describe('RestRouter — deadline', () => {
 
     delete process.env.WIGOLO_SERVE_MAX_CONCURRENCY;
     delete process.env.WIGOLO_SERVE_TIMEOUT_SCALE;
+  });
+
+  it('aborts in-flight work when the HTTP client disconnects', async () => {
+    let requestSignal: AbortSignal | undefined;
+    vi.mocked(dispatchTool).mockImplementation(async (_tool, _body, ctx) => {
+      requestSignal = ctx.signal;
+      return new Promise((_resolve, reject) => {
+        ctx.signal?.addEventListener('abort', () => reject(ctx.signal?.reason), { once: true });
+      });
+    });
+    const router = loopbackRouter();
+    const req = makeReq({ url: '/v1/search', body: JSON.stringify({ query: 'x' }) });
+    const pending = router.handle(req, makeRes().res);
+    await vi.waitFor(() => expect(requestSignal).toBeDefined());
+
+    req.emit('aborted');
+    await pending;
+
+    expect(requestSignal?.aborted).toBe(true);
+    expect(requestSignal?.reason).toMatchObject({ name: 'AbortError' });
   });
 });

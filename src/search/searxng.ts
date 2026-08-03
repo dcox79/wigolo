@@ -1,6 +1,8 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../types.js';
 import { getConfig } from '../config.js';
 import { createLogger } from '../logger.js';
+import { withEngineRequest } from './engines/engine-request.js';
+import { assertUpstreamOk } from './engines/upstream-error.js';
 
 const log = createLogger('search');
 
@@ -55,7 +57,6 @@ export class SearxngClient implements SearchEngine {
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
     const config = getConfig();
-    const timeoutMs = options.timeoutMs ?? config.searxngQueryTimeoutMs;
     const maxResults = options.maxResults ?? 10;
 
     // Build query with domain site: operators
@@ -93,25 +94,29 @@ export class SearxngClient implements SearchEngine {
     const url = `${this.baseUrl}/search?${params}`;
     log.debug('querying searxng', { query: queryStr, url });
 
-    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    return withEngineRequest(
+      this.name,
+      options,
+      config.searxngQueryTimeoutMs,
+      async (signal) => {
+        const response = await fetch(url, { signal });
+        assertUpstreamOk(this.name, response);
 
-    if (!response.ok) {
-      throw new Error(`SearXNG returned ${response.status}`);
-    }
+        const data = (await response.json()) as SearxngApiResponse;
+        const total = data.results.length;
 
-    const data = (await response.json()) as SearxngApiResponse;
-    const total = data.results.length;
-
-    return data.results.slice(0, maxResults).map((r, i) => {
-      const published = r.publishedDate ?? r.pubdate ?? undefined;
-      return {
-        title: r.title,
-        url: r.url,
-        snippet: r.content,
-        relevance_score: r.score != null ? Math.min(r.score, 1) : 1 - i / Math.max(total, 1),
-        engine: 'searxng',
-        ...(published ? { published_date: published } : {}),
-      };
-    });
+        return data.results.slice(0, maxResults).map((r, i) => {
+          const published = r.publishedDate ?? r.pubdate ?? undefined;
+          return {
+            title: r.title,
+            url: r.url,
+            snippet: r.content,
+            relevance_score: r.score != null ? Math.min(r.score, 1) : 1 - i / Math.max(total, 1),
+            engine: 'searxng',
+            ...(published ? { published_date: published } : {}),
+          };
+        });
+      },
+    );
   }
 }

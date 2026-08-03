@@ -292,8 +292,8 @@ describe('config', () => {
   });
 
   describe('config — multi-query', () => {
-    it('multiQueryConcurrency defaults to 5', () => {
-      expect(getConfig().multiQueryConcurrency).toBe(5);
+    it('multiQueryConcurrency defaults to 2', () => {
+      expect(getConfig().multiQueryConcurrency).toBe(2);
     });
 
     it('multiQueryConcurrency reads from WIGOLO_MULTI_QUERY_CONCURRENCY', () => {
@@ -302,8 +302,8 @@ describe('config', () => {
       expect(getConfig().multiQueryConcurrency).toBe(3);
     });
 
-    it('multiQueryMax defaults to 10', () => {
-      expect(getConfig().multiQueryMax).toBe(10);
+    it('multiQueryMax defaults to 5', () => {
+      expect(getConfig().multiQueryMax).toBe(5);
     });
 
     it('multiQueryMax reads from WIGOLO_MULTI_QUERY_MAX', () => {
@@ -315,13 +315,13 @@ describe('config', () => {
     it('multiQueryConcurrency falls back to default on non-numeric', () => {
       process.env.WIGOLO_MULTI_QUERY_CONCURRENCY = 'abc';
       resetConfig();
-      expect(getConfig().multiQueryConcurrency).toBe(5);
+      expect(getConfig().multiQueryConcurrency).toBe(2);
     });
 
     it('multiQueryMax falls back to default on non-numeric', () => {
       process.env.WIGOLO_MULTI_QUERY_MAX = '';
       resetConfig();
-      expect(getConfig().multiQueryMax).toBe(10);
+      expect(getConfig().multiQueryMax).toBe(5);
     });
   });
 

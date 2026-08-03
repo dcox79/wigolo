@@ -1,5 +1,7 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -12,7 +14,6 @@ export class WikipediaEngine implements SearchEngine {
   name = 'wikipedia';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
     const language = (options.language ?? 'en').slice(0, 2).toLowerCase();
 
@@ -27,18 +28,20 @@ export class WikipediaEngine implements SearchEngine {
 
     log.debug('querying wikipedia opensearch', { query, language });
 
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        'User-Agent': 'wigolo/0.1 (https://github.com/KnockOutEZ/wigolo)',
-        'Accept': 'application/json',
-      },
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, {
+        signal,
+        headers: {
+          'User-Agent': 'wigolo/0.1 (https://github.com/KnockOutEZ/wigolo)',
+          'Accept': 'application/json',
+        },
+      });
+
+      assertUpstreamOk(this.name, response);
+
+      const body = await response.json();
+      return this.parseResults(body, maxResults);
     });
-
-    if (!response.ok) throw new Error(`Wikipedia returned ${response.status}`);
-
-    const body = await response.json();
-    return this.parseResults(body, maxResults);
   }
 
   parseResults(body: unknown, maxResults: number): RawSearchResult[] {

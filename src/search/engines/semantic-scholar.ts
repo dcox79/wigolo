@@ -1,5 +1,7 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -40,7 +42,6 @@ export class SemanticScholarEngine implements SearchEngine {
   name = 'semantic-scholar';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const params = new URLSearchParams({
@@ -60,11 +61,13 @@ export class SemanticScholarEngine implements SearchEngine {
     const url = `https://api.semanticscholar.org/graph/v1/paper/search?${params}`;
     log.debug('semantic-scholar search', { query });
 
-    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!response.ok) throw new Error(`Semantic Scholar returned ${response.status}`);
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, { signal });
+      assertUpstreamOk(this.name, response);
 
-    const data = (await response.json()) as S2Response;
-    return this.parsePapers(data.data ?? []);
+      const data = (await response.json()) as S2Response;
+      return this.parsePapers(data.data ?? []);
+    });
   }
 
   private parsePapers(papers: S2Paper[]): RawSearchResult[] {

@@ -40,6 +40,7 @@ export class DevDocsEngine implements SearchEngine {
   name = 'devdocs';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
+    options.signal?.throwIfAborted();
     const maxResults = options.maxResults ?? 10;
     const tokens = query
       .toLowerCase()
@@ -58,6 +59,7 @@ export class DevDocsEngine implements SearchEngine {
     const total = limited.length;
     const results: RawSearchResult[] = [];
     for (let i = 0; i < total; i++) {
+      options.signal?.throwIfAborted();
       const doc = limited[i];
       results.push({
         title: doc.title,

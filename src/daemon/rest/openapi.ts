@@ -207,8 +207,9 @@ const STATUS_MAPPING_NOTE =
   'origin rejected; 404 no such route; 405 wrong method; 413 body over the size cap; ' +
   '429 too many in-flight requests; 500 internal error; 501 route not implemented; ' +
   '502 upstream fetch failure; 503 a subsystem (browser engine / search sidecar) is ' +
-  'unavailable; 504 the route deadline elapsed. A 504 does not cancel the underlying ' +
-  'work. A degraded-but-successful result stays 200 with honest fields (e.g. a ' +
+  'unavailable; 504 the route deadline elapsed. A 504 aborts cooperative underlying ' +
+  'work while its concurrency slot remains held until cleanup settles. A degraded-but-successful ' +
+  'result stays 200 with honest fields (e.g. a ' +
   '`warning`) rather than an error status.';
 
 const ERROR_STATUS_CODES = ['400', '401', '403', '404', '405', '413', '429', '500', '501', '502', '503', '504'];
@@ -308,6 +309,39 @@ function buildPaths(): Record<string, object> {
                   },
                   required: ['name', 'description', 'endpoint'],
                 },
+              },
+            },
+          },
+        },
+        ...errorResponses(),
+      },
+    },
+  };
+
+  paths['/v1/diagnostics'] = {
+    get: {
+      operationId: 'getDiagnostics',
+      summary: 'Read-only live process and admission diagnostics.',
+      description:
+        'Returns process memory, model lifecycle state, browser capacity, and per-engine ' +
+        'breaker/admission counters. It never includes credentials, request content, URLs, or upstream error text.',
+      security: [{}, { bearerAuth: [] }],
+      responses: {
+        '200': {
+          description: 'Current read-only daemon diagnostics.',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  status: { type: 'string' },
+                  memory: { type: 'object', additionalProperties: true },
+                  models: { type: 'object', additionalProperties: true },
+                  engines: { type: 'array', items: { type: 'object', additionalProperties: true } },
+                  browser_capacity: { type: 'object', additionalProperties: true },
+                },
+                required: ['status', 'memory', 'models', 'engines', 'browser_capacity'],
+                additionalProperties: false,
               },
             },
           },

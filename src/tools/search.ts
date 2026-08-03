@@ -25,6 +25,7 @@ export async function handleSearch(
   backendStatus?: BackendStatus,
   samplingServer?: SamplingCapableServer,
   onProgress?: ProgressCallback,
+  signal?: AbortSignal,
 ): Promise<StageResult<SearchOutput>> {
   const provider = await getSearchProvider();
   return provider.search(input, {
@@ -33,5 +34,6 @@ export async function handleSearch(
     backendStatus,
     samplingServer,
     onProgress,
+    signal,
   });
 }

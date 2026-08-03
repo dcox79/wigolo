@@ -1,6 +1,8 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
 import { getConfig } from '../../config.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -53,7 +55,6 @@ export class BraveImageEngine implements SearchEngine {
         'BRAVE_API_KEY not set — set the env var to enable Brave image search',
       );
     }
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = Math.min(options.maxResults ?? 10, 100);
 
     const params = new URLSearchParams({
@@ -69,18 +70,20 @@ export class BraveImageEngine implements SearchEngine {
 
     log.debug('brave-image: querying api', { query });
 
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        'X-Subscription-Token': apiKey,
-        'Accept': 'application/json',
-      },
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, {
+        signal,
+        headers: {
+          'X-Subscription-Token': apiKey,
+          'Accept': 'application/json',
+        },
+      });
+
+      assertUpstreamOk(this.name, response);
+
+      const body = (await response.json()) as BraveImageBody;
+      return this.parseResults(body, maxResults);
     });
-
-    if (!response.ok) throw new Error(`Brave image returned ${response.status}`);
-
-    const body = (await response.json()) as BraveImageBody;
-    return this.parseResults(body, maxResults);
   }
 
   parseResults(body: unknown, maxResults: number): RawSearchResult[] {

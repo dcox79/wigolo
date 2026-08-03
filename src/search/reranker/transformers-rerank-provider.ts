@@ -11,8 +11,13 @@ import type {
 } from '../../providers/rerank-provider.js';
 import { createLogger } from '../../logger.js';
 import { getConfig } from '../../config.js';
+import {
+  IdleModelRuntime,
+  type ModelRuntimeSnapshot,
+} from '../../providers/model-runtime.js';
 
 const log = createLogger('reranker');
+const DEFAULT_RERANKER_IDLE_TIMEOUT_MS = 300_000;
 
 // Cross-encoder reranker via Transformers.js.
 //
@@ -29,6 +34,17 @@ type Model = Awaited<ReturnType<typeof AutoModelForSequenceClassification.from_p
 interface LogitsTensor {
   data: ArrayLike<number>;
   dims: number[];
+}
+
+interface LoadedReranker {
+  tokenizer: Tokenizer;
+  model: Model;
+}
+
+export interface TransformersRerankProviderOptions {
+  idleTimeoutMs?: number;
+  /** Injection seam for lifecycle tests. */
+  load?: () => Promise<LoadedReranker>;
 }
 
 // Recognize the noisy huggingface fetch failure signature and replace it
@@ -49,46 +65,49 @@ function wrapLoadError(err: unknown): Error {
 }
 
 export class TransformersRerankProvider implements RerankProvider {
-  private tokenizer: Tokenizer | null = null;
-  private model: Model | null = null;
-  private loadPromise: Promise<{ tokenizer: Tokenizer; model: Model }> | null = null;
+  private readonly runtime: IdleModelRuntime<LoadedReranker>;
   readonly modelId: string;
 
-  constructor() {
+  constructor(options: TransformersRerankProviderOptions = {}) {
     this.modelId = 'Xenova/ms-marco-MiniLM-L-6-v2';
+    const configuredTimeout = getConfig().rerankerIdleTimeoutMs;
+    const idleTimeoutMs = options.idleTimeoutMs
+      ?? (Number.isFinite(configuredTimeout)
+        ? configuredTimeout
+        : DEFAULT_RERANKER_IDLE_TIMEOUT_MS);
+    this.runtime = new IdleModelRuntime({
+      name: 'reranker',
+      modelId: this.modelId,
+      idleTimeoutMs,
+      load: options.load ?? (() => this.loadModel()),
+      dispose: async ({ model }) => {
+        const disposable = model as unknown as { dispose?: () => Promise<unknown> };
+        if (typeof disposable.dispose === 'function') await disposable.dispose();
+      },
+    });
   }
 
   async warmup(): Promise<void> {
-    await this.load();
+    await this.runtime.warmup();
   }
 
-  private load(): Promise<{ tokenizer: Tokenizer; model: Model }> {
-    if (this.tokenizer && this.model) {
-      return Promise.resolve({ tokenizer: this.tokenizer, model: this.model });
-    }
-    if (this.loadPromise) return this.loadPromise;
-
+  private loadModel(): Promise<LoadedReranker> {
     log.info('Loading rerank model', { modelId: this.modelId });
     const cacheDir = join(getConfig().dataDir, 'transformers');
     // Direct the library at a writable cache under the wigolo data dir so
     // models don't end up in a user home cache the daemon can't manage.
     env.cacheDir = cacheDir;
 
-    this.loadPromise = Promise.all([
+    return Promise.all([
       AutoTokenizer.from_pretrained(this.modelId),
       AutoModelForSequenceClassification.from_pretrained(this.modelId),
     ])
       .then(([tokenizer, model]) => {
-        this.tokenizer = tokenizer;
-        this.model = model;
         return { tokenizer, model };
       })
       .catch((err: unknown) => {
-        this.loadPromise = null;
         throw wrapLoadError(err);
       });
-
-    return this.loadPromise;
   }
 
   async rerank(
@@ -98,48 +117,42 @@ export class TransformersRerankProvider implements RerankProvider {
   ): Promise<RerankResult[]> {
     if (candidates.length === 0) return [];
 
-    const { tokenizer, model } = await this.load();
+    return this.runtime.withResource(async ({ tokenizer, model }) => {
+      // Build batch: query repeated against each document.
+      const queries = candidates.map(() => query);
+      const docs = candidates.map((c) => c.text);
 
-    // Build batch: query repeated against each document.
-    const queries = candidates.map(() => query);
-    const docs = candidates.map((c) => c.text);
+      const inputs = tokenizer(queries, {
+        text_pair: docs,
+        padding: true,
+        truncation: true,
+      });
 
-    const inputs = tokenizer(queries, {
-      text_pair: docs,
-      padding: true,
-      truncation: true,
+      const outputs = (await model(inputs)) as { logits: LogitsTensor };
+      const logits = outputs.logits;
+      // logits shape is [batch, 1] for single-label regression rerankers.
+      // For multi-label heads (rare for rerankers) we still take the first
+      // value as the relevance score.
+      const stride = logits.dims.length >= 2 ? logits.dims[1] : 1;
+      const data = logits.data;
+
+      const scored: RerankResult[] = candidates.map((c, i) => ({
+        id: c.id,
+        score: Number(data[i * stride]),
+      }));
+
+      return scored.sort((a, b) => b.score - a.score).slice(0, topK);
     });
-
-    const outputs = (await model(inputs)) as { logits: LogitsTensor };
-    const logits = outputs.logits;
-    // logits shape is [batch, 1] for single-label regression rerankers.
-    // For multi-label heads (rare for rerankers) we still take the first
-    // value as the relevance score.
-    const stride = logits.dims.length >= 2 ? logits.dims[1] : 1;
-    const data = logits.data;
-
-    const scored: RerankResult[] = candidates.map((c, i) => ({
-      id: c.id,
-      score: Number(data[i * stride]),
-    }));
-
-    return scored.sort((a, b) => b.score - a.score).slice(0, topK);
   }
 
   // Release the underlying ONNX session before process exit. Without this,
   // the runtime's worker threads race during C++ destructor teardown and
   // surface as `mutex lock failed: Invalid argument` on macOS.
   async dispose(): Promise<void> {
-    const model = this.model;
-    this.model = null;
-    this.tokenizer = null;
-    this.loadPromise = null;
-    if (!model) return;
-    try {
-      const m = model as unknown as { dispose?: () => Promise<unknown> };
-      if (typeof m.dispose === 'function') await m.dispose();
-    } catch (err) {
-      log.debug('reranker dispose failed', { error: err instanceof Error ? err.message : String(err) });
-    }
+    await this.runtime.dispose();
+  }
+
+  getRuntimeState(): ModelRuntimeSnapshot {
+    return this.runtime.snapshot();
   }
 }

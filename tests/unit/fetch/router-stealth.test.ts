@@ -209,4 +209,26 @@ describe('router stealth under off / on', () => {
     await router.fetch('https://spa.example/');
     expect(browserCalls[0].stealth).toBe(true);
   });
+
+  it('routes the default mode=stealth escalation through the configured browser pool', async () => {
+    process.env.WIGOLO_STEALTH = 'auto';
+    resetConfig();
+    const browserPool = makeBrowserPool();
+    const router = new SmartRouter({
+      httpFetcher: vi.fn(async (url: string) => ({
+        url,
+        html: '<html><body><div id="root"></div></body></html>',
+        text: '',
+      })),
+      browserPool,
+    });
+
+    const result = await router.fetch('https://spa.example/', { mode: 'stealth' });
+
+    expect(browserPool.fetchWithBrowser).toHaveBeenCalledOnce();
+    expect(vi.mocked(browserPool.fetchWithBrowser).mock.calls[0]?.[1]).toMatchObject({
+      stealth: true,
+    });
+    expect(result).toMatchObject({ method: 'browser', escalated: true });
+  });
 });

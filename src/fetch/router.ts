@@ -140,6 +140,7 @@ export interface HttpClient {
  * single fetch into the dedicated anti-bot fingerprint-hardening context path.
  */
 export interface BrowserFetchArgs {
+  timeoutMs?: number;
   headers?: Record<string, string>;
   storageStatePath?: string;
   userDataDir?: string;
@@ -160,7 +161,7 @@ export interface BrowserPoolInterface {
   /** Optional pre-launch of the browser engine so a later fetch doesn't pay
    *  cold-start inline. Idempotent + best-effort. Pools that don't implement it
    *  simply skip prewarming. */
-  warm?(): Promise<void>;
+  warm?(signal?: AbortSignal): Promise<void>;
 }
 
 export type HttpFetcher = (
@@ -530,7 +531,8 @@ export class SmartRouter {
       this.httpClient = opts.httpClient;
       this.browserPool = opts.browserPool;
       this.httpFetcher = opts.httpFetcher ?? this.makeDefaultHttpFetcher();
-      this.playwrightFetcher = opts.playwrightFetcher ?? fetchWithPlaywright;
+      this.playwrightFetcher = opts.playwrightFetcher
+        ?? (opts.browserPool ? this.poolBackedPlaywrightFetcher(opts.browserPool) : fetchWithPlaywright);
       this.tlsFetcher = opts.tlsFetcher ?? tlsFetch;
       this.tlsPersistence = opts.tlsPersistence ?? defaultTlsPersistence();
       this.pdfProbe = opts.pdfProbe ?? defaultPdfProbe;
@@ -544,13 +546,41 @@ export class SmartRouter {
       this.httpClient = httpClientOrOptions as HttpClient;
     }
     this.httpFetcher = this.makeDefaultHttpFetcher();
-    this.playwrightFetcher = fetchWithPlaywright;
+    this.playwrightFetcher = this.browserPool
+      ? this.poolBackedPlaywrightFetcher(this.browserPool)
+      : fetchWithPlaywright;
     this.tlsFetcher = tlsFetch;
     this.tlsPersistence = defaultTlsPersistence();
     this.pdfProbe = defaultPdfProbe;
     this.browserAcquirer = new BrowserAcquirer();
     this.clearanceStore = defaultClearanceStore();
     this.dnsLookup = undefined;
+  }
+
+  /**
+   * Keep the legacy PlaywrightFetcher seam for tests and callers that inject a
+   * custom renderer, but route the production stealth escalation through the
+   * same MultiBrowserPool as every other browser tier. This removes the daemon
+   * browser as an independent production capacity path.
+   */
+  private poolBackedPlaywrightFetcher(browserPool: BrowserPoolInterface): PlaywrightFetcher {
+    return async (url, options = {}) => {
+      const result = await browserPool.fetchWithBrowser(url, {
+        timeoutMs: options.timeoutMs,
+        signal: options.signal,
+        requestGuard: options.requestGuard,
+        stealth: true,
+      });
+      return {
+        html: result.html,
+        text: result.html,
+        completeness: result.contentCompleteness ?? {
+          level: 'partial',
+          reason: 'never_settled',
+          settled_by: 'budget',
+        },
+      };
+    };
   }
 
   /**
@@ -911,12 +941,11 @@ export class SmartRouter {
           headers: {},
         };
       }
-      // The stealth escalation uses the daemon browser helper
-      // (playwright-tier.ts), which is a browser-tier entry outside browserFetch.
-      // Thread lazy acquisition here too so no escalation call site is left
-      // unthreaded — when the browser can't be acquired within budget, return the
-      // static content already in hand with the actionable note rather than a
-      // hard failure or a minutes-long block.
+      // The production default routes this escalation through MultiBrowserPool
+      // with stealth hardening, so it shares the process-wide browser capacity
+      // gate. The injectable PlaywrightFetcher seam remains for tests/custom
+      // renderers. Thread lazy acquisition here so either implementation gets
+      // the same bounded readiness behavior.
       const acquired = await this.browserAcquirer.ensureBrowser();
       if (acquired !== 'ready') {
         logger.info('stealth escalation: browser engine not ready within budget — returning static content with note', { url });
@@ -1371,9 +1400,9 @@ export class SmartRouter {
    * a no-op when no browser pool is configured or the pool doesn't support
    * warming. Latency-only; never changes fetch results.
    */
-  async prewarmBrowser(): Promise<void> {
+  async prewarmBrowser(signal?: AbortSignal): Promise<void> {
     if (this.browserPool?.warm) {
-      await this.browserPool.warm();
+      await this.browserPool.warm(signal);
     }
   }
 

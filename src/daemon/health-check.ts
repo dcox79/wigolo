@@ -1,5 +1,9 @@
 import type { BackendStatus } from '../server/backend-status.js';
 import type { MultiBrowserPool } from '../fetch/browser-pool.js';
+import {
+  getRuntimeTelemetry,
+  type RuntimeTelemetry,
+} from './runtime-telemetry.js';
 
 export interface HealthProbeInput {
   backendStatus: BackendStatus | null;
@@ -20,11 +24,14 @@ export interface HealthReport {
   browsers: 'ready' | 'not_initialized';
   cache: 'active' | 'not_initialized';
   uptime_seconds: number;
+  memory: RuntimeTelemetry['memory'];
+  models: RuntimeTelemetry['models'];
 }
 
 export function probeHealth(input: HealthProbeInput): HealthReport {
   const uptimeMs = Date.now() - input.startedAt;
   const uptimeSeconds = Math.round(uptimeMs / 1000);
+  const runtime = getRuntimeTelemetry();
 
   const browsers: HealthReport['browsers'] = input.browserPool
     ? 'ready'
@@ -43,6 +50,7 @@ export function probeHealth(input: HealthProbeInput): HealthReport {
       browsers,
       cache,
       uptime_seconds: uptimeSeconds,
+      ...runtime,
     };
   }
 
@@ -70,5 +78,6 @@ export function probeHealth(input: HealthProbeInput): HealthReport {
     browsers,
     cache,
     uptime_seconds: uptimeSeconds,
+    ...runtime,
   };
 }

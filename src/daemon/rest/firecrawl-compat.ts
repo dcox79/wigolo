@@ -88,6 +88,8 @@ function jobStoreMaxBytes(): number {
 export interface CompatContext {
   subsystems: Subsystems;
   bindIsLoopback: boolean;
+  /** Shared route deadline/caller cancellation for synchronous compat work. */
+  signal?: AbortSignal;
   /** Path after the `/compat/firecrawl` prefix, e.g. `/v1/scrape`. */
   subPath: string;
   respond: (status: number, body: unknown, headers?: Record<string, string>) => void;
@@ -323,6 +325,8 @@ async function handleSearchRoute(req: IncomingMessage, ctx: CompatContext): Prom
     router,
     backendStatus,
     undefined as unknown as SamplingCapableServer,
+    undefined,
+    ctx.signal,
   );
   if (!r.ok) {
     return fail(ctx, statusForStageResult(r), stageFailureMessage(r));

@@ -225,6 +225,21 @@ describe('firecrawl-compat — search', () => {
     expect(captured[0].status).toBe(500);
     expect((captured[0].body as { success: boolean }).success).toBe(false);
   });
+
+  it('threads the route deadline signal into compat search', async () => {
+    mockHandleSearch.mockResolvedValue({
+      ok: true,
+      data: { results: [], query: 'q', engines_used: [], total_time_ms: 1 },
+    });
+    const controller = new AbortController();
+    const { handleCompatRequest } = await importShim();
+    const { ctx } = makeCtx('/v1/search');
+    ctx.signal = controller.signal;
+
+    await handleCompatRequest(fakeReq('POST', { query: 'q' }), FAKE_RES, ctx);
+
+    expect(mockHandleSearch.mock.calls[0]?.[6]).toBe(controller.signal);
+  });
 });
 
 describe('firecrawl-compat — map', () => {

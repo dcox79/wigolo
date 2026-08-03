@@ -8,9 +8,14 @@ const log = createLogger('search');
 
 const RRF_K = 60;
 
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('search aborted', 'AbortError');
+}
+
 export function normalizeQueries(queries: string[]): string[] {
   try {
     const config = getConfig();
+    const maxQueries = Math.max(1, Math.floor(config.multiQueryMax || 5));
     const seen = new Set<string>();
     const normalized: string[] = [];
 
@@ -22,12 +27,12 @@ export function normalizeQueries(queries: string[]): string[] {
       normalized.push(q);
     }
 
-    if (normalized.length > config.multiQueryMax) {
+    if (normalized.length > maxQueries) {
       log.warn('multi-query array exceeds max, truncating', {
         provided: normalized.length,
-        max: config.multiQueryMax,
+        max: maxQueries,
       });
-      return normalized.slice(0, config.multiQueryMax);
+      return normalized.slice(0, maxQueries);
     }
 
     return normalized;
@@ -46,6 +51,7 @@ export interface FanOutOptions {
   fromDate?: string;
   toDate?: string;
   category?: 'general' | 'news' | 'code' | 'docs' | 'papers' | 'images';
+  signal?: AbortSignal;
 }
 
 export interface FanOutResult {
@@ -69,7 +75,8 @@ export async function fanOutSearch(
 
   try {
     const config = getConfig();
-    const concurrency = config.multiQueryConcurrency;
+    const concurrency = Math.max(1, Math.floor(config.multiQueryConcurrency || 2));
+    if (options.signal?.aborted) throw abortReason(options.signal);
 
     const hasFilterAttrition = !!(options.includeDomains?.length || options.excludeDomains?.length);
     const overfetchFactor = hasFilterAttrition ? 3 : 2;
@@ -83,6 +90,7 @@ export async function fanOutSearch(
       fromDate: options.fromDate,
       toDate: options.toDate,
       category: options.category,
+      signal: options.signal,
     };
 
     // Q9-followup: when multi-hop decomposition produced ≥3 sub-queries,
@@ -100,6 +108,7 @@ export async function fanOutSearch(
     }
 
     for (let i = 0; i < tasks.length; i += concurrency) {
+      if (options.signal?.aborted) throw abortReason(options.signal);
       const batch = tasks.slice(i, i + concurrency);
       const promises = batch.map(async ({ engine, query }) => {
         try {
@@ -109,6 +118,9 @@ export async function fanOutSearch(
             enginesUsed.add(engine.name);
           }
         } catch (err) {
+          // Cancellation is a top-level control signal, not an engine failure.
+          // Re-throw it so the batch stops and no later queued batch starts.
+          if (options.signal?.aborted) throw abortReason(options.signal);
           const msg = err instanceof Error ? err.message : String(err);
           log.warn('multi-query engine search failed', {
             engine: engine.name,
@@ -120,6 +132,7 @@ export async function fanOutSearch(
       });
 
       await Promise.allSettled(promises);
+      if (options.signal?.aborted) throw abortReason(options.signal);
     }
 
     return {
@@ -128,6 +141,7 @@ export async function fanOutSearch(
       errors,
     };
   } catch (err) {
+    if (options.signal?.aborted) throw abortReason(options.signal);
     log.error('fanOutSearch failed', { error: String(err) });
     return {
       results: allResults,

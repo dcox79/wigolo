@@ -1,6 +1,8 @@
 import type { SearchEngine, SearchEngineOptions, RawSearchResult } from '../../types.js';
 import { createLogger } from '../../logger.js';
 import { getConfig } from '../../config.js';
+import { withEngineRequest } from './engine-request.js';
+import { assertUpstreamOk } from './upstream-error.js';
 
 const log = createLogger('search');
 
@@ -28,7 +30,6 @@ export class GithubCodeEngine implements SearchEngine {
   name = 'github-code';
 
   async search(query: string, options: SearchEngineOptions = {}): Promise<RawSearchResult[]> {
-    const timeoutMs = options.timeoutMs ?? 10000;
     const maxResults = options.maxResults ?? 10;
 
     const params = new URLSearchParams({
@@ -51,20 +52,13 @@ export class GithubCodeEngine implements SearchEngine {
     const token = getConfig().githubToken;
     if (token) headers.Authorization = `Bearer ${token}`;
 
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers,
+    return withEngineRequest(this.name, options, 10_000, async (signal) => {
+      const response = await fetch(url, { signal, headers });
+      assertUpstreamOk(this.name, response);
+
+      const data = (await response.json()) as GhResponse;
+      return this.parseItems(data.items ?? []);
     });
-
-    if (response.status === 403) {
-      throw new Error(`GitHub code rate-limited (${response.status})`);
-    }
-    if (!response.ok) {
-      throw new Error(`GitHub code returned ${response.status}`);
-    }
-
-    const data = (await response.json()) as GhResponse;
-    return this.parseItems(data.items ?? []);
   }
 
   private parseItems(items: GhCodeItem[]): RawSearchResult[] {

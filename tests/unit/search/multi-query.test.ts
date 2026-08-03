@@ -25,7 +25,14 @@ import { getConfig } from '../../../src/config.js';
 // --- normalizeQueries tests ---
 
 describe('normalizeQueries', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getConfig).mockReturnValue({
+      multiQueryConcurrency: 5,
+      multiQueryMax: 10,
+      searxngQueryTimeoutMs: 8000,
+    } as any);
+  });
 
   it('lowercases all queries', () => {
     const result = normalizeQueries(['React Hooks', 'VUE COMPOSITION']);
@@ -61,6 +68,14 @@ describe('normalizeQueries', () => {
     const result = normalizeQueries(queries);
     expect(result).toHaveLength(3);
     expect(result).toEqual(['a', 'b', 'c']);
+  });
+
+  it('clamps an invalid non-positive max to one', () => {
+    vi.mocked(getConfig).mockReturnValue({
+      multiQueryConcurrency: 2,
+      multiQueryMax: -4,
+    } as any);
+    expect(normalizeQueries(['a', 'b', 'c'])).toEqual(['a']);
   });
 
   it('returns empty array for empty input', () => {
@@ -214,6 +229,29 @@ describe('fanOutSearch', () => {
 
     const callArgs = vi.mocked(engine.search).mock.calls[0][1] as SearchEngineOptions;
     expect(callArgs.maxResults).toBeGreaterThan(5);
+  });
+
+  it('does not start later batches after caller cancellation', async () => {
+    vi.mocked(getConfig).mockReturnValue({
+      multiQueryConcurrency: 1,
+      multiQueryMax: 10,
+    } as any);
+    const controller = new AbortController();
+    const reason = new DOMException('caller cancelled', 'AbortError');
+    const engine: SearchEngine = {
+      name: 'cancel-aware',
+      search: vi.fn(async () => {
+        controller.abort(reason);
+        throw reason;
+      }),
+    };
+
+    await expect(fanOutSearch(
+      ['q1', 'q2', 'q3'],
+      [engine],
+      { maxResults: 5, signal: controller.signal },
+    )).rejects.toBe(reason);
+    expect(engine.search).toHaveBeenCalledTimes(1);
   });
 });
 

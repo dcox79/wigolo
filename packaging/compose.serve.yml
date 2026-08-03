@@ -65,6 +65,9 @@ services:
       # Optimized defaults: broad retrieval, learned per-domain TLS hardening,
       # and startup model warmup. Each remains host-overridable.
       WIGOLO_SEARCH: ${WIGOLO_SEARCH:-hybrid}
+      WIGOLO_MULTI_QUERY_MAX: ${WIGOLO_MULTI_QUERY_MAX:-5}
+      WIGOLO_MULTI_QUERY_CONCURRENCY: ${WIGOLO_MULTI_QUERY_CONCURRENCY:-2}
+      WIGOLO_SERVE_MAX_CONCURRENCY: ${WIGOLO_SERVE_MAX_CONCURRENCY:-4}
       WIGOLO_TLS_TIER: ${WIGOLO_TLS_TIER:-auto}
       WIGOLO_EAGER_WARMUP: ${WIGOLO_EAGER_WARMUP:-1}
       # Synthesis provider and credentials are injected only at container
@@ -76,6 +79,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       WIGOLO_GITHUB_TOKEN: ${WIGOLO_GITHUB_TOKEN:-}
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
       SEARXNG_URL: http://searxng:8080
       WIGOLO_API_TOKEN_FILE: /run/secrets/wigolo_api_token
       WIGOLO_TELEMETRY: "0"
@@ -83,7 +87,7 @@ services:
       WIGOLO_FETCH_ALLOW_PRIVATE: "0"
       WIGOLO_SERVE_ALLOW_LOCAL_TARGETS: "0"
       WIGOLO_SERVE_ALLOW_UNAUTHENTICATED: "0"
-      MAX_BROWSERS: "1"
+      MAX_BROWSERS: ${MAX_BROWSERS:-1}
     healthcheck:
       # The daemon serves /health over HTTP; the stdio default command does not,
       # which is why no healthcheck is baked into the image itself.
