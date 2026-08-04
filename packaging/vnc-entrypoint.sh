@@ -48,6 +48,13 @@ x11vnc -storepasswd "${VNC_PASSWORD}" "${PASSWD_FILE}" >/dev/null 2>&1
 unset VNC_PASSWORD
 
 # --- virtual display -------------------------------------------------------
+# Pre-create the socket directory. /tmp is a fresh tmpfs on every start and Xvfb
+# runs unprivileged, so it logs `_XSERVTransmkdir: euid != 0` and falls back
+# when the directory is absent. Creating it here keeps the X socket on the
+# expected path and drops a misleading error from the startup logs.
+mkdir -p /tmp/.X11-unix
+chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+
 # -nolisten tcp: the display is reachable only through the local unix socket.
 Xvfb "${DISPLAY}" -screen 0 "${SCREEN_GEOMETRY}" -nolisten tcp &
 

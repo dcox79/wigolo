@@ -124,11 +124,15 @@ LABEL org.opencontainers.image.title="wigolo" \
 # then made readable by the node user.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
 USER root
-# Both drivers are installed into the same baked path. patchright ships a
-# SEPARATE patched Chromium build (it is a Playwright fork, not a wrapper), so
-# `playwright install` alone leaves stealthDriver=patchright with no binary to
-# launch — it then silently falls back to the standard driver. Installing both
-# is what makes WIGOLO_STEALTH_DRIVER=patchright actually take effect.
+# Install browsers for BOTH drivers into the same baked path. At the currently
+# pinned versions patchright resolves to the same chromium revision playwright
+# does (verified: both report /opt/browsers/chromium-1223/chrome-linux64/chrome),
+# so this step is presently a no-op in disk terms. It is kept because patchright
+# is an independently versioned fork: the moment its pinned revision diverges
+# from playwright's, `playwright install` alone would leave
+# stealthDriver=patchright with no binary and it would silently fall back to the
+# standard driver. Running both installs makes that failure mode impossible
+# rather than dependent on the two pins staying aligned.
 RUN mkdir -p /opt/browsers \
     && ./node_modules/.bin/playwright install chromium \
     && ./node_modules/.bin/patchright install chromium \
