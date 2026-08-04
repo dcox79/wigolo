@@ -22,3 +22,8 @@
 !assets/blocks/
 !assets/blocks/**
 !assets/legacy-skill-hashes.json
+
+# Single file, not the whole packaging/ directory: the `vnc` target needs this
+# entrypoint in the build context, but the compose files beside it reference
+# host secret paths and have no business in an image layer.
+!packaging/vnc-entrypoint.sh

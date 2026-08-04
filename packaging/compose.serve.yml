@@ -13,7 +13,23 @@
 #   [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
 #   [IO.File]::WriteAllText($env:WIGOLO_API_TOKEN_SECRET_FILE,
 #     [Convert]::ToHexString($bytes).ToLowerInvariant())
+#   # VNC password for the human-solve surface (see the vnc notes below):
+#   $env:WIGOLO_VNC_PASSWORD_SECRET_FILE = Join-Path $secretDir 'docker-vnc-password'
+#   $vnc = [byte[]]::new(16)
+#   [Security.Cryptography.RandomNumberGenerator]::Fill($vnc)
+#   [IO.File]::WriteAllText($env:WIGOLO_VNC_PASSWORD_SECRET_FILE,
+#     [Convert]::ToHexString($vnc).ToLowerInvariant())
 #   docker compose -f packaging/compose.serve.yml up --build
+#
+# HUMAN-SOLVE / noVNC: this compose builds the `vnc` image target, which runs a
+# virtual display the browser draws into and exposes a noVNC web client on
+# http://127.0.0.1:6080 (loopback only, password from the secret above). When
+# the solve ladder exhausts its automated rungs it prompts on stderr and waits;
+# open that URL, solve the challenge in the live browser, and the fetch resumes
+# with the harvested clearance. Note that VNC's own password scheme is weak and
+# the transport is unencrypted — acceptable strictly because the port never
+# leaves host loopback. Do not publish it to a routable interface.
+# Set WIGOLO_DOCKER_TARGET=full and WIGOLO_HUMAN_SOLVE=off to drop all of this.
 #
 # This file builds the CHECKED-OUT SOURCE into the local-only image name
 # `wigolo-local:reviewed`; it never pulls or runs an unpinned wigolo image.
@@ -37,7 +53,13 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-      target: ${WIGOLO_DOCKER_TARGET:-default}
+      # `vnc` (not `default`): the anti-bot ladder needs the browser binaries
+      # baked in, and the human-solve rung needs a display someone can see. The
+      # slim `default` target downloads Playwright chromium on first use and
+      # never fetches patchright's separate patched build, so
+      # stealthDriver=patchright would silently fall back to the standard driver.
+      # Set WIGOLO_DOCKER_TARGET=full to drop the VNC surface but keep the rest.
+      target: ${WIGOLO_DOCKER_TARGET:-vnc}
       pull: true
     depends_on:
       searxng:
@@ -52,13 +74,25 @@ services:
       - no-new-privileges:true
     ports:
       - "127.0.0.1:${WIGOLO_HOST_PORT:-3333}:3333"
+      # noVNC web client. Loopback-published: this grants full mouse/keyboard
+      # control of a browser that may hold authenticated sessions, so it must
+      # never be bound to a routable interface. Password-gated in the entrypoint.
+      - "127.0.0.1:${WIGOLO_NOVNC_HOST_PORT:-6080}:6080"
     volumes:
       - wigolo-data:/data
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1777
-    shm_size: 256mb
+      # Raised from 256m: Xvfb's X socket and the browser's scratch files share
+      # this with the existing tmp usage.
+      - /tmp:rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=1777
+      # Xvfb compiles its keymap here; the root filesystem stays read-only.
+      - /var/lib/xkb:rw,noexec,nosuid,nodev,size=8m,uid=1000,gid=1000,mode=0700
+    # Chromium puts renderer shared buffers in /dev/shm; the 64m Docker default
+    # (and 256m at MAX_BROWSERS=1) crashes renderers once several browsers run
+    # concurrently. Scale with MAX_BROWSERS.
+    shm_size: ${WIGOLO_SHM_SIZE:-1gb}
     secrets:
       - wigolo_api_token
+      - wigolo_vnc_password
     environment:
       WIGOLO_DATA_DIR: /data
       WIGOLO_PLUGINS_DIR: /app/disabled-plugins
@@ -87,7 +121,66 @@ services:
       WIGOLO_FETCH_ALLOW_PRIVATE: "0"
       WIGOLO_SERVE_ALLOW_LOCAL_TARGETS: "0"
       WIGOLO_SERVE_ALLOW_UNAUTHENTICATED: "0"
-      MAX_BROWSERS: ${MAX_BROWSERS:-1}
+      # Each concurrent Chromium costs roughly 300-500 MB; the stealth path
+      # launches a dedicated throwaway browser per fetch rather than reusing a
+      # pooled context, so this is the real memory driver. Keep mem_limit below
+      # in step with any change here.
+      MAX_BROWSERS: ${MAX_BROWSERS:-3}
+      # --- Anti-bot solve ladder -----------------------------------------
+      # Every value below is QUOTED deliberately: YAML 1.1 coerces bare on/off
+      # to true/false, and wigolo normalizes anything that is not the literal
+      # string 'on'/'auto' to 'off' — an unquoted `on` would silently DISABLE
+      # the knob it looks like it enables.
+      #
+      # Precedence in config.ts is: explicit knob > hardcore preset > default,
+      # and a knob counts as explicit whenever its env var is present. Compose
+      # always sets these, so each value here wins outright and the preset is
+      # left supplying only the raised 30s challenge-completion floor.
+      WIGOLO_HARDCORE: "${WIGOLO_HARDCORE:-on}"
+      # Enabled rungs.
+      WIGOLO_STEALTH: "${WIGOLO_STEALTH:-on}"
+      WIGOLO_STEALTH_DRIVER: "${WIGOLO_STEALTH_DRIVER:-patchright}"
+      WIGOLO_HUMANIZE: "${WIGOLO_HUMANIZE:-on}"
+      WIGOLO_AUTO_PASS: "${WIGOLO_AUTO_PASS:-on}"
+      WIGOLO_CDP_DIRECT: "${WIGOLO_CDP_DIRECT:-auto}"
+      WIGOLO_PROXY_BYPASS_ON_CHALLENGE: "${WIGOLO_PROXY_BYPASS_ON_CHALLENGE:-false}"
+      # AI-vision captcha solving — OFF by request. Also note the upstream
+      # rationale: pointing a vision model at a security control may breach the
+      # provider's AUP, so this is the one rung left disabled.
+      WIGOLO_AI_SOLVE: "${WIGOLO_AI_SOLVE:-off}"
+      # Human-solve: ON, with a real viewable window via the `vnc` target.
+      # Open http://127.0.0.1:6080 and solve the challenge in the live browser.
+      #
+      # Both halves of the gate are required. hasVisibleSurface is derived
+      # PURELY from browserHeadful — it does not probe for an actual display —
+      # so HEADFUL=true is what makes the rung eligible, and the Xvfb+noVNC
+      # stack is what makes that claim true. If you switch the build target back
+      # to `full` (no VNC), set WIGOLO_HUMAN_SOLVE=off at the same time or every
+      # challenged fetch blocks for the timeout below waiting on nobody.
+      WIGOLO_HUMAN_SOLVE: "${WIGOLO_HUMAN_SOLVE:-on}"
+      WIGOLO_HUMAN_SOLVE_CONSENT: "${WIGOLO_HUMAN_SOLVE_CONSENT:-true}"
+      # Raised from the 120s default: that budget assumes someone already
+      # watching a window, not someone opening noVNC after the prompt appears.
+      # This is a per-challenge upper bound, not a fixed cost.
+      WIGOLO_HUMAN_SOLVE_MS: "${WIGOLO_HUMAN_SOLVE_MS:-300000}"
+      # Headful against the Xvfb display, so the window exists and is viewable.
+      # WINDOWLESS must stay false here: it is the no-display substitute, and
+      # would defeat the point of the VNC surface.
+      WIGOLO_BROWSER_HEADFUL: "${WIGOLO_BROWSER_HEADFUL:-true}"
+      WIGOLO_BROWSER_WINDOWLESS: "false"
+      # Matches the `vnc` target's baked ENV; set explicitly so the value is
+      # visible here rather than only in the Dockerfile.
+      DISPLAY: ":99"
+      WIGOLO_VNC_PASSWORD_FILE: /run/secrets/wigolo_vnc_password
+      WIGOLO_VNC_GEOMETRY: "${WIGOLO_VNC_GEOMETRY:-1920x1080x24}"
+      # The image runs `playwright install chromium` only — there is no real
+      # Chrome binary — so pin the channel rather than paying a failed
+      # channel:'chrome' launch probe on the first stealth fetch.
+      WIGOLO_BROWSER_CHANNEL: "${WIGOLO_BROWSER_CHANNEL:-chromium}"
+      # Optional third-party solver service (Tier-B escape hatch). NOT a URL you
+      # visit — it is a credentialed endpoint wigolo posts challenges to. Unset
+      # by default; it is credential-bearing, so prefer the keychain over env.
+      WIGOLO_SOLVER_URL: "${WIGOLO_SOLVER_URL:-}"
     healthcheck:
       # The daemon serves /health over HTTP; the stdio default command does not,
       # which is why no healthcheck is baked into the image itself.
@@ -99,7 +192,11 @@ services:
       # and browser-engine downloads into the volume.
       start_period: 120s
     pids_limit: 512
-    mem_limit: ${WIGOLO_MEMORY_LIMIT:-2g}
+    # Raised from 2g alongside MAX_BROWSERS=3: three concurrent stealth
+    # Chromiums plus the on-device embedding/rerank models do not fit in 2g,
+    # and the OOM killer lands on the browser mid-fetch rather than failing
+    # cleanly. Lower this only if you also lower MAX_BROWSERS.
+    mem_limit: ${WIGOLO_MEMORY_LIMIT:-4g}
     cpus: ${WIGOLO_CPU_LIMIT:-2.0}
     stop_grace_period: 20s
     logging:
@@ -178,3 +275,8 @@ secrets:
     # The token is mounted read-only, not placed in the container environment
     # or image. Keep this host file outside the repository and user-readable only.
     file: ${WIGOLO_API_TOKEN_SECRET_FILE:?Set WIGOLO_API_TOKEN_SECRET_FILE to the host token file}
+  wigolo_vnc_password:
+    # Gates the noVNC surface. Mounted as a file rather than passed through the
+    # environment so it never appears in `docker inspect` or the process list.
+    # The entrypoint refuses to start if this is missing or empty.
+    file: ${WIGOLO_VNC_PASSWORD_SECRET_FILE:?Set WIGOLO_VNC_PASSWORD_SECRET_FILE to the host VNC password file}

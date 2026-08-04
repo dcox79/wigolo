@@ -1,13 +1,19 @@
 # =============================================================================
-# wigolo container image — two build targets:
+# wigolo container image — three build targets:
 #   default (slim): OS libraries for the browser engine baked at build time;
 #                   the browser binary and on-device models download on FIRST USE
 #                   into the /data volume. Smallest image; ideal for MCP stdio use.
-#   full:           browser binary preinstalled at build time. Larger image;
-#                   ideal for JS-render-heavy or ephemeral `--rm` runs with no
-#                   persistent volume.
+#   full:           Playwright AND patchright browser binaries preinstalled at
+#                   build time. Larger image; ideal for JS-render-heavy or
+#                   ephemeral `--rm` runs with no persistent volume, and required
+#                   for the patchright stealth driver.
+#   vnc:            `full` plus Xvfb + x11vnc + noVNC, so the human-solve rung
+#                   has a visible surface a person can actually reach. Largest
+#                   image and the widest attack surface — build it only for
+#                   human-in-the-loop solving.
 # Build the default target:  docker build --pull --target default -t wigolo-local:reviewed .
 # Build the full target:     docker build --pull --target full -t wigolo-local:reviewed-full .
+# Build the vnc target:      docker build --pull --target vnc -t wigolo-local:reviewed-vnc .
 # =============================================================================
 
 # Keep the runtime base immutable. Renovate/Dependabot (or a deliberate manual
@@ -118,7 +124,44 @@ LABEL org.opencontainers.image.title="wigolo" \
 # then made readable by the node user.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
 USER root
+# Both drivers are installed into the same baked path. patchright ships a
+# SEPARATE patched Chromium build (it is a Playwright fork, not a wrapper), so
+# `playwright install` alone leaves stealthDriver=patchright with no binary to
+# launch — it then silently falls back to the standard driver. Installing both
+# is what makes WIGOLO_STEALTH_DRIVER=patchright actually take effect.
 RUN mkdir -p /opt/browsers \
     && ./node_modules/.bin/playwright install chromium \
+    && ./node_modules/.bin/patchright install chromium \
     && chown -R node:node /opt/browsers
 USER 1000:1000
+
+# ---- vnc: `full` plus a viewable display for the human-solve rung ----
+# The human-solve rung hard no-ops without a visible surface, so a container
+# that should ever hand a challenge to a person needs a display and a way to
+# reach it. Adds Xvfb (virtual display), x11vnc (VNC server) and noVNC (browser
+# client) on top of `full`. Strictly larger and strictly more attack surface
+# than `full` — build this target only when you actually want human-in-the-loop
+# solving; otherwise use `full` and leave WIGOLO_HUMAN_SOLVE=off.
+FROM full AS vnc
+LABEL org.opencontainers.image.title="wigolo" \
+      org.opencontainers.image.description="Local-first web intelligence MCP server with the browser engine preinstalled and a noVNC-viewable display for human-in-the-loop challenge solving." \
+      org.opencontainers.image.source="https://github.com/KnockOutEZ/wigolo"
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         xvfb \
+         x11vnc \
+         novnc \
+         websockify \
+    && rm -rf /var/lib/apt/lists/*
+# Debian's novnc package ships vnc.html but no index.html, so the bare
+# http://127.0.0.1:6080 would 404. Symlink it so the documented URL works.
+RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
+COPY --chown=root:root --chmod=0555 packaging/vnc-entrypoint.sh /usr/local/bin/vnc-entrypoint.sh
+# Xvfb compiles a keymap into /var/lib/xkb; the runtime filesystem is read-only,
+# so the directory must exist and be supplied as a tmpfs by Compose.
+RUN install -d -o 1000 -g 1000 -m 0700 /var/lib/xkb
+ENV DISPLAY=:99
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/vnc-entrypoint.sh"]
+CMD ["mcp"]
