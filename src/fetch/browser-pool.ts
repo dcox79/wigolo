@@ -1513,7 +1513,16 @@ export class MultiBrowserPool {
         consent: config.humanSolveConsent,
         onNeedHuman: async () => {
           await this.bringToFront(page).catch(() => {});
-          log.warn('a challenge needs you to solve it in the browser window', { url });
+          // bringToFront raises a window on a local desktop. In a container the
+          // browser draws into Xvfb, so the only way a human reaches it is the
+          // configured surface (noVNC) — name it, or the prompt points at a
+          // window that exists on no screen the operator can see.
+          const surface = config.humanSolveSurfaceUrl;
+          if (surface) {
+            log.warn(`a challenge needs you to solve it at ${surface}`, { url, surface });
+          } else {
+            log.warn('a challenge needs you to solve it in the browser window', { url });
+          }
         },
         readContent,
         readCookies,

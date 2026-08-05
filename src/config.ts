@@ -326,6 +326,16 @@ export interface Config {
    * WIGOLO_HUMAN_SOLVE_CONSENT. */
   humanSolveConsent: boolean;
   /**
+   * Where a human can actually reach the visible surface, echoed in the prompt
+   * that asks someone to solve a challenge. Only meaningful when the surface is
+   * not the local desktop — in a container the browser draws into Xvfb and the
+   * operator reaches it over noVNC, so "solve it in the browser window" names a
+   * window that does not exist on any screen they have. `null` (default) keeps
+   * the original desktop-oriented wording. http/https only; any userinfo is
+   * stripped before it reaches a log line. WIGOLO_SOLVE_SURFACE_URL.
+   */
+  humanSolveSurfaceUrl: string | null;
+  /**
    * Opt-in hosted-CDP (Bright-Data-style) websocket endpoint. When set, an
    * escape rung connects over this CDP endpoint (built-in IP + solver +
    * fingerprint server-side) instead of launching locally. Credential-gated,
@@ -581,6 +591,48 @@ function resolveKeychainSecret(envKey: string, settingsKey: string): string | nu
   return readCredentialFromKeychain(credentialKeychainUser(settingsKey));
 }
 
+/**
+ * Sanitize the human-solve surface URL. This value's ONLY consumer is a log
+ * line addressed to a human, so it is held to log-safety rules rather than
+ * fetch rules: http/https only (no `javascript:` / `file:` reaching an operator
+ * who may paste it into a browser), userinfo stripped (a surface behind basic
+ * auth would otherwise print its password into the logs), and no control
+ * characters (a bare newline lets the value forge a second log record).
+ * Anything that fails returns null and warns — the prompt then falls back to
+ * its original wording instead of naming a place that may not be real.
+ */
+function resolveSolveSurfaceUrl(raw: string | null): string | null {
+  if (!raw) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    process.stderr.write(
+      `[wigolo] WIGOLO_SOLVE_SURFACE_URL is not a valid URL; ignoring it.\n`,
+    );
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    process.stderr.write(
+      `[wigolo] WIGOLO_SOLVE_SURFACE_URL must be http or https; ignoring it.\n`,
+    );
+    return null;
+  }
+  parsed.username = '';
+  parsed.password = '';
+  const clean = parsed.toString();
+  // URL parsing already rejects raw control characters in most positions, but
+  // percent-decoding is not applied here, so this is a cheap belt-and-braces
+  // check on the final string that actually reaches the log.
+  if (/[\x00-\x1f\x7f]/.test(clean)) {
+    process.stderr.write(
+      `[wigolo] WIGOLO_SOLVE_SURFACE_URL contains control characters; ignoring it.\n`,
+    );
+    return null;
+  }
+  return clean;
+}
+
 /** Default user-agent for the opt-in Reddit OAuth-API path. Generic +
  * capability-clean; overridable via WIGOLO_REDDIT_USER_AGENT. */
 export const DEFAULT_REDDIT_USER_AGENT = 'web:wigolo:v1.0 (web intelligence agent)';
@@ -783,6 +835,9 @@ export function getConfig(): Config {
     })(),
     humanSolveTimeoutMs: envInt('WIGOLO_HUMAN_SOLVE_MS', 120000, settings, 'humanSolveTimeoutMs'),
     humanSolveConsent: envBool('WIGOLO_HUMAN_SOLVE_CONSENT', false, settings, 'humanSolveConsent'),
+    humanSolveSurfaceUrl: resolveSolveSurfaceUrl(
+      envStr('WIGOLO_SOLVE_SURFACE_URL', null, settings, 'humanSolveSurfaceUrl'),
+    ),
     scrapingBrowserWss: resolveCredentialUrl(
       envStr('WIGOLO_SCRAPING_BROWSER_WSS', null, settings, 'scrapingBrowserWss'),
       'scrapingBrowserWss',

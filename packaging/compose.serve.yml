@@ -163,6 +163,12 @@ services:
       # watching a window, not someone opening noVNC after the prompt appears.
       # This is a per-challenge upper bound, not a fixed cost.
       WIGOLO_HUMAN_SOLVE_MS: "${WIGOLO_HUMAN_SOLVE_MS:-300000}"
+      # Printed in the prompt that asks a human to solve the challenge. Without
+      # it the prompt says "solve it in the browser window" — accurate on a
+      # desktop, useless in a container where the window lives on Xvfb. This is
+      # the HOST-side URL, so it must track the published port below, not the
+      # container's 6080.
+      WIGOLO_SOLVE_SURFACE_URL: "${WIGOLO_SOLVE_SURFACE_URL:-http://127.0.0.1:${WIGOLO_NOVNC_HOST_PORT:-6080}}"
       # Headful against the Xvfb display, so the window exists and is viewable.
       # WINDOWLESS must stay false here: it is the no-display substitute, and
       # would defeat the point of the VNC surface.

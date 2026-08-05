@@ -83,6 +83,16 @@ websockify --web /usr/share/novnc "0.0.0.0:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}
 
 echo "[vnc-entrypoint] noVNC on container port ${NOVNC_PORT}; display ${DISPLAY} (${SCREEN_GEOMETRY})" >&2
 
+# The container cannot know its own published host port, so the reachable URL
+# comes from the environment. Echo it at startup as well as in the solve prompt:
+# an operator who sees it in the boot log knows where to go BEFORE a challenge
+# fires, rather than discovering the address only when something is blocking.
+if [ -n "${WIGOLO_SOLVE_SURFACE_URL:-}" ]; then
+  echo "[vnc-entrypoint] human-solve surface: ${WIGOLO_SOLVE_SURFACE_URL}" >&2
+else
+  echo "[vnc-entrypoint] WIGOLO_SOLVE_SURFACE_URL unset; solve prompts will not name a URL" >&2
+fi
+
 # exec so wigolo owns PID 1's signal handling (Compose `init: true` reaps the
 # background helpers when the container stops).
 exec node /app/dist/index.js "$@"
